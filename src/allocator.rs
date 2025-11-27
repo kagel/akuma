@@ -10,7 +10,9 @@ static TALC: Spinlock<Talc<ErrOnOom>> = Spinlock::new(Talc::new(ErrOnOom));
 
 pub fn init() {
     unsafe {
-        TALC.lock().claim(Span::from_array(&raw mut HEAP_MEM)).unwrap();
+        TALC.lock()
+            .claim(Span::from_array(&raw mut HEAP_MEM))
+            .unwrap();
     }
 }
 

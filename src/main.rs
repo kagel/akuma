@@ -7,8 +7,7 @@ mod allocator;
 mod boot;
 mod console;
 
-use alloc::string::String;
-use alloc::vec::Vec;
+use alloc::{string::ToString, vec::Vec};
 use core::panic::PanicInfo;
 
 #[panic_handler]
@@ -22,29 +21,32 @@ static PROMPT: &str = "Akuma >: ";
 pub extern "C" fn _start() -> ! {
     allocator::init();
 
-    console::print(PROMPT);
-
-    let mut should_exit = false;    
+    let mut should_exit = false;
     while should_exit == false {
+        console::print(PROMPT);
+
         let mut buffer = Vec::new();
         let len = console::read_line(&mut buffer, true);
         if len == 0 {
             continue;
         }
         if let Ok(text) = core::str::from_utf8(&buffer[..len]) {
-            match text {
+            console::print("\n");
+            match text.trim().to_lowercase().as_str() {
                 "exit" => {
-                    console::print("\nBye!\n");
+                    console::print_as_akuma("MEOWWWW!");
                     should_exit = true;
                 }
                 "meow" => {
-                    console::print("\nMeow\n");
+                    console::print_as_akuma("Meow");
                 }
                 _ => {
-                    // nothing to do for now
+                    console::print_as_akuma("pffft");
                 }
             }
         }
-        console::print(PROMPT);
     }
+
+    // _start must never return (!) - hang forever
+    loop {}
 }

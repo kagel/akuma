@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use crate::alloc::string::ToString;
+use alloc::vec::Vec;
 
 const UART0_BASE: usize = 0x0900_0000;
 const UART0_DR: *mut u8 = UART0_BASE as *mut u8; // Data register (offset 0x00)
@@ -55,4 +55,10 @@ pub fn read_line(buffer: &mut Vec<u8>, with_echo: bool) -> usize {
             }
         }
     }
+}
+
+pub fn print_as_akuma(s: &str) {
+    print("≽ܫ≼ ... ");
+    print(s);
+    print("\n")
 }
