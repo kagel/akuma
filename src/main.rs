@@ -15,5 +15,15 @@ pub extern "C" fn _start() -> ! {
     // named `_start` by default
     let promt = "Akuma >: ";
     console::print(promt);
-    loop {}
+    loop {
+        // let mut buffer = [0u8; 100];
+        // let len = console::read_line(&mut buffer);
+        // // Convert &[u8] to &str
+        // if let Ok(text) = core::str::from_utf8(&buffer[..len]) {
+        //     console::print(text);
+        // } else {
+        //     console::print("Invalid input\n");
+        // }
+        // console::print(promt);
+    }
 }
