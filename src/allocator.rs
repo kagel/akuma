@@ -11,17 +11,19 @@ pub fn init(heap_start: usize, heap_size: usize) -> Result<(), &'static str> {
     if heap_size == 0 {
         return Err("Heap size cannot be zero");
     }
-    
+
     if heap_start == 0 {
         return Err("Invalid heap start address");
     }
-    
+
     unsafe {
         let heap_ptr = heap_start as *mut u8;
         let span = Span::from_base_size(heap_ptr, heap_size);
-        TALC.lock().claim(span).map_err(|_| "Failed to claim heap memory")?;
+        TALC.lock()
+            .claim(span)
+            .map_err(|_| "Failed to claim heap memory")?;
     }
-    
+
     Ok(())
 }
 
