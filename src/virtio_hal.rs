@@ -2,6 +2,10 @@
 
 use virtio_drivers::Hal;
 use core::ptr::NonNull;
+use spinning_top::Spinlock;
+
+// Track which IRQs are registered for cleanup
+static REGISTERED_IRQS: Spinlock<alloc::vec::Vec<u32>> = Spinlock::new(alloc::vec::Vec::new());
 
 pub struct VirtioHal;
 

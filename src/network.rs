@@ -97,9 +97,21 @@ impl NetworkStack {
         // Find virtio-mmio devices from device tree
         let virtio_addrs = find_virtio_mmio_devices(dtb_ptr)?;
         
+        crate::console::print("Probing virtio devices...\n");
+        
         // Try each virtio device we found
-        for addr in virtio_addrs {
+        for (idx, addr) in virtio_addrs.iter().enumerate() {
+            let addr = *addr;
             unsafe {
+                // Read version first to check legacy vs modern
+                let version = core::ptr::read_volatile((addr + 0x004) as *const u32);
+                let device_id = core::ptr::read_volatile((addr + 0x008) as *const u32);
+                
+                if device_id != 0 {
+                    crate::console::print("Device at 0x");
+                    crate::console::print(&alloc::format!("{:x}: version={}, device_id={}\n", addr, version, device_id));
+                }
+                
                 // Create VirtIOHeader pointer
                 let header_ptr = core::ptr::NonNull::new_unchecked(addr as *mut VirtIOHeader);
                 
@@ -111,6 +123,11 @@ impl NetworkStack {
                     // Check if it's virtio-net using the enum
                     use virtio_drivers::transport::DeviceType;
                     if matches!(device_type, DeviceType::Network) {
+                        // Register IRQ handler for this virtio device
+                        // QEMU virt machine maps virtio-mmio devices to IRQ 16+ (0x10+)
+                        let irq = 16 + idx as u32;
+                        crate::irq::register_handler(irq, virtio_irq_handler);
+                        
                         let net_device = VirtIONet::<VirtioHal, MmioTransport, 16>::new(transport, 4096)
                             .map_err(|_| "Failed to initialize virtio-net")?;
                         
@@ -204,4 +221,11 @@ where
 {
     let mut network = NETWORK.lock();
     network.as_mut().map(f)
+}
+
+// Virtio IRQ handler
+fn virtio_irq_handler(_irq: u32) {
+    // The virtio-drivers crate handles the actual interrupt processing
+    // when we call methods like recv() or send()
+    // For now, just acknowledge the interrupt (already done by IRQ infrastructure)
 }

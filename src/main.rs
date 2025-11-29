@@ -10,6 +10,9 @@ mod executor;
 mod network;
 mod timer;
 mod virtio_hal;
+mod gic;
+mod exceptions;
+mod irq;
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -80,6 +83,14 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     console::print(&(heap_size / 1024 / 1024).to_string());
     console::print(" MB\n");
 
+    // Initialize GIC (Generic Interrupt Controller)
+    gic::init();
+    console::print("GIC initialized\n");
+    
+    // Set up exception vectors and enable IRQs
+    exceptions::init();
+    console::print("IRQ handling enabled\n");
+
     // Initialize async executor
     executor::init();
     console::print("Async executor initialized\n");
@@ -119,29 +130,16 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     drop(test_vec);
     console::print("Allocator OK\n");
 
-    // Network stack initialization is currently disabled due to hang in VirtIONet::new()
-    // 
-    // Status:
-    // - virtio-net device is detected at 0xa000000 (device_id=0x1, vendor_id=QEMU)
-    // - MmioTransport successfully created
-    // - VirtIONet::new() hangs after 4 DMA allocations and 1 share() call
-    // 
-    // Root cause: The virtio-drivers crate expects interrupt/IRQ support for device
-    // initialization. The driver polls device status registers waiting for IRQs that
-    // never arrive since we haven't implemented interrupt handling yet.
-    //
-    // TODO: Implement ARM GIC (Generic Interrupt Controller) and virtio IRQ handling
-    // 
-    // Uncomment below once IRQ support is added:
-    // console::print("Initializing network...\n");
-    // match network::init(dtb_ptr) {
-    //     Ok(()) => console::print("Network initialized successfully!\n"),
-    //     Err(e) => {
-    //         console::print("Network init failed: ");
-    //         console::print(e);
-    //         console::print("\n");
-    //     }
-    // }
+    // Try network initialization with legacy virtio mode
+    console::print("Initializing network...\n");
+    match network::init(dtb_ptr) {
+        Ok(()) => console::print("Network initialized successfully!\n"),
+        Err(e) => {
+            console::print("Network init failed: ");
+            console::print(e);
+            console::print("\n");
+        }
+    }
 
     // Spawn example async tasks
     executor::spawn(async_example_task());
