@@ -52,8 +52,6 @@ unsafe impl core::alloc::GlobalAlloc for Talck {
             let ptr = self.alloc(layout);
             if !ptr.is_null() {
                 core::ptr::write_bytes(ptr, 0, layout.size());
-            } else {
-                crate::console::print("\n[ALLOC_ZEROED FAIL]\n");
             }
             ptr
         }

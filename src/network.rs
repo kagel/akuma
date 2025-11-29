@@ -188,7 +188,7 @@ impl NetworkStack {
     }
 }
 
-pub async fn init(dtb_ptr: usize) -> Result<(), &'static str> {
+pub fn init(dtb_ptr: usize) -> Result<(), &'static str> {
     let mut network = NETWORK.lock();
     match NetworkStack::new(dtb_ptr) {
         Ok(stack) => {

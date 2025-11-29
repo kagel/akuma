@@ -136,7 +136,7 @@ pub fn process_irq_work() {
         let mut queue = IRQ_WORK_QUEUE.lock();
         core::mem::take(&mut *queue)
     };
-    
+
     // Process each item
     for work in work_items {
         match work {

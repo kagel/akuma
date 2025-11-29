@@ -11,6 +11,7 @@ mod executor;
 mod gic;
 mod irq;
 mod network;
+mod threading;
 mod timer;
 mod virtio_hal;
 
@@ -91,9 +92,8 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     exceptions::init();
     console::print("IRQ handling enabled\n");
 
-    // Initialize async executor
-    executor::init();
-    console::print("Async executor initialized\n");
+    // Skip executor - using threads instead
+    // executor::init();
 
     // Initialize timer
     timer::init();
@@ -120,11 +120,18 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     console::print(&(timer::uptime_us() / 1_000_000).to_string());
     console::print(" seconds\n");
 
+    // Initialize threading (IRQs still enabled, timer not yet configured)
+    console::print("Initializing threading...\n");
+    threading::init();
+    console::print("Threading system initialized\n");
+
     // Enable timer-driven preemptive multitasking
     // Timer IRQ is PPI 14, which maps to IRQ 30 (16 + 14)
+    console::print("Registering timer IRQ...\n");
     irq::register_handler(30, |_| timer::timer_irq_handler());
-    timer::enable_timer_interrupts(1_000); // 1ms intervals
-    console::print("Preemptive scheduling enabled (1ms timer)\n");
+    console::print("Enabling timer...\n");
+    timer::enable_timer_interrupts(10_000); // 10ms intervals
+    console::print("Preemptive scheduling enabled (10ms timer)\n");
 
     // Test allocator
     let mut test_vec: Vec<u32> = Vec::new();
@@ -136,23 +143,67 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     drop(test_vec);
     console::print("Allocator OK\n");
 
-    // Spawn example async tasks
-    executor::spawn(async_example_task());
+    // Heartbeat thread
+    extern "C" fn heartbeat_thread() -> ! {
+        // Make sure IRQs are enabled
+        unsafe {
+            core::arch::asm!("msr daifclr, #2");
+        }
 
-    // Network disabled - virtio-drivers spin_loop() requires real OS threads
-    // See NETWORKING_STATUS.md for details
-    console::print("Network: Disabled (virtio spin_loop incompatible with async executor)\n");
+        let mut count = 0u32;
+        loop {
+            // Wait using busy-wait (will be preempted by timer IRQ)
+            for _ in 0..50_000_000 {
+                unsafe { core::arch::asm!("nop") };
+            }
+
+            count += 1;
+            console::print("[Heartbeat #");
+            console::print(&count.to_string());
+            console::print(" at ");
+            console::print(&timer::utc_iso8601_simple());
+            console::print("]\n");
+        }
+    }
+
+    // Network initialization thread
+    extern "C" fn network_thread() -> ! {
+        console::print("[NetThread] Starting network initialization...\n");
+
+        // Small delay to let system stabilize
+        for _ in 0..1000000 {
+            unsafe { core::arch::asm!("nop") };
+        }
+
+        // Try to initialize network (will use busy-waiting, but timer will preempt us!)
+        match network::init(0) {
+            Ok(()) => console::print("[NetThread] Network initialized successfully!\n"),
+            Err(e) => {
+                console::print("[NetThread] Network init failed: ");
+                console::print(e);
+                console::print("\n");
+            }
+        }
+
+        loop {
+            unsafe { core::arch::asm!("wfi") };
+        }
+    }
+
+    // Spawn threads
+    threading::spawn(heartbeat_thread).expect("Failed to spawn heartbeat thread");
+    console::print("Heartbeat thread spawned\n");
+
+    // TODO: Network thread disabled for now (virtio-drivers still uses busy-waiting)
+    // threading::spawn(network_thread).expect("Failed to spawn network thread");
+    // console::print("Network thread spawned\n");
 
     let mut should_exit = false;
     let mut buffer = Vec::new();
     let mut prompt_shown = false;
 
     while should_exit == false {
-        // Process any work queued from IRQ handlers
-        executor::process_irq_work();
-        
-        // Run async tasks (non-blocking)
-        executor::run_once();
+        // No executor - threads run preemptively via timer IRQ
 
         // Show prompt if we're ready for input
         if !prompt_shown && buffer.is_empty() {
