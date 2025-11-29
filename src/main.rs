@@ -91,12 +91,23 @@ pub extern "C" fn _start(dtb_ptr: usize) -> ! {
     console::print(&(timer::uptime_us() / 1_000_000).to_string());
     console::print(" seconds\n");
 
+    // test Vec::remove()
+    // let mut vec = Vec::new();
+    // vec.push(1);
+    // vec.push(2);
+    // vec.push(3);
+    // vec.remove(1);
+    // console::print("Vec: ");
+    // console::print(&vec[0].to_string());
+    // console::print("\n");
+
+
     // Initialize network stack
     // TODO: Network stack initialization hangs in smoltcp Interface::new()
     // This appears to be related to the allocator issue we saw with Vec::remove()
     // Disabled for now until we investigate allocator problems
-    // network::init();
-    // console::print("Network stack initialized\n");
+    network::init();
+    console::print("Network stack initialized\n");
 
     // Spawn example async tasks
     executor::spawn(async_example_task());
@@ -109,8 +120,6 @@ pub extern "C" fn _start(dtb_ptr: usize) -> ! {
         // Run async tasks (non-blocking)
         executor::run_once();
         
-        // network::poll(); // Disabled - network not initialized
-
         // Show prompt if we're ready for input
         if !prompt_shown && buffer.is_empty() {
             console::print(PROMPT);

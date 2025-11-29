@@ -45,4 +45,29 @@ unsafe impl core::alloc::GlobalAlloc for Talck {
                 .free(core::ptr::NonNull::new_unchecked(ptr), layout);
         }
     }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: core::alloc::Layout, new_size: usize) -> *mut u8 {
+        unsafe {
+            // Create new layout with the new size
+            let new_layout = match core::alloc::Layout::from_size_align(new_size, layout.align()) {
+                Ok(layout) => layout,
+                Err(_) => return core::ptr::null_mut(),
+            };
+
+            // Allocate new memory
+            let new_ptr = self.alloc(new_layout);
+            if new_ptr.is_null() {
+                return core::ptr::null_mut();
+            }
+
+            // Copy old data to new location (copy the minimum of old and new sizes)
+            let copy_size = core::cmp::min(layout.size(), new_size);
+            core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+
+            // Free old memory
+            self.dealloc(ptr, layout);
+
+            new_ptr
+        }
+    }
 }
