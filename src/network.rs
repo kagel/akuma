@@ -81,10 +81,11 @@ static NETWORK: Spinlock<Option<NetworkStack>> = Spinlock::new(None);
 
 impl NetworkStack {
     pub fn new() -> Self {
-        let device = DummyDevice::new();
-
+        let mut device = DummyDevice::new();
         let config = Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into());
-        let mut interface = Interface::new(config, &mut DummyDevice::new(), Instant::ZERO);
+        
+        // NOTE: Interface::new() hangs - likely allocator issue
+        let mut interface = Interface::new(config, &mut device, Instant::ZERO);
 
         // Configure IP address
         interface.update_ip_addrs(|ip_addrs| {
