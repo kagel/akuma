@@ -83,11 +83,12 @@ impl Device for VirtioNetDevice {
 // Helpers
 // ============================================================================
 
+#[inline(always)]
 fn log(msg: &[u8]) {
     unsafe {
         const UART: *mut u8 = 0x0900_0000 as *mut u8;
-        for c in msg {
-            UART.write_volatile(*c);
+        for &c in msg {
+            core::ptr::write_volatile(UART, c);
         }
     }
 }
@@ -131,24 +132,28 @@ pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
     log(b"[Net] init\n");
 
     // Register lo0 (loopback)
-    log(b"[Net] lo0: UP\n");
     register_interface(b"lo0", 1, [0; 6]);
+    log(b"[Net] lo0: UP\n");
 
     // Scan for ethernet
-    log(b"[Net] Scanning...\n");
     let addrs: [usize; 8] = [
         0x0a000000, 0x0a000200, 0x0a000400, 0x0a000600, 0x0a000800, 0x0a000a00, 0x0a000c00,
         0x0a000e00,
     ];
 
-    for &addr in addrs.iter() {
+    for (i, &addr) in addrs.iter().enumerate() {
+        log(b"[");
+        log(&[b'0' + i as u8]);
+        log(b"]");
+
         unsafe {
             let device_id = core::ptr::read_volatile((addr + 0x008) as *const u32);
             if device_id != 1 {
+                log(b"- ");
                 continue;
             }
 
-            log(b"[Net] found!\n");
+            log(b"!\n");
 
             let header_ptr = match core::ptr::NonNull::new(addr as *mut VirtIOHeader) {
                 Some(p) => p,
@@ -160,12 +165,8 @@ pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
                 Err(_) => continue,
             };
 
-            // Delay for device
-            for _ in 0..50_000_000 {
-                core::arch::asm!("nop");
-            }
+            log(b"[Net] virtio init...\n");
 
-            log(b"[Net] virtio\n");
             let net = match VirtIONetRaw::<VirtioHal, MmioTransport, 16>::new(transport) {
                 Ok(n) => n,
                 Err(_) => {
@@ -177,14 +178,15 @@ pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
             let mac = net.mac_address();
             let mut dev = VirtioNetDevice { inner: net };
 
-            log(b"[Net] smoltcp\n");
+            log(b"[Net] smoltcp...\n");
+
             let hw = EthernetAddress::from_bytes(&mac);
             let cfg = Config::new(HardwareAddress::Ethernet(hw));
             let _iface = Interface::new(cfg, &mut dev, Instant::ZERO);
 
             log(b"[Net] eth0: ");
-            for (i, &b) in mac.iter().enumerate() {
-                if i > 0 {
+            for (j, &b) in mac.iter().enumerate() {
+                if j > 0 {
                     log(b":");
                 }
                 log_hex_byte(b);

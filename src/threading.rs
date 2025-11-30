@@ -246,30 +246,42 @@ impl ThreadPool {
         // Find first free slot (skip slot 0 = idle)
         for i in 1..MAX_THREADS {
             if self.slots[i].state == ThreadState::Free {
-                // Setup the thread
+                // Setup the thread - write all fields point-by-point to avoid
+                // large struct copies which can hang due to compiler optimization issues
                 let stack_base = self.stacks[i];
                 let stack_top = stack_base + STACK_SIZE;
-                let sp = (stack_top & !0xF) as u64; // 16-byte aligned
-
+                let sp = (stack_top & !0xF) as u64;
                 let entry_addr = entry as *const () as u64;
 
-                let mut ctx = Context::zero();
-                ctx.sp = sp;
-                ctx.x19 = entry_addr;
-                ctx.x30 = thread_start as *const () as u64;
-                ctx.x29 = 0;
+                // Write context fields individually (128-byte struct copy was hanging)
+                self.slots[i].context.x19 = entry_addr;
+                self.slots[i].context.x20 = 0;
+                self.slots[i].context.x21 = 0;
+                self.slots[i].context.x22 = 0;
+                self.slots[i].context.x23 = 0;
+                self.slots[i].context.x24 = 0;
+                self.slots[i].context.x25 = 0;
+                self.slots[i].context.x26 = 0;
+                self.slots[i].context.x27 = 0;
+                self.slots[i].context.x28 = 0;
+                self.slots[i].context.x29 = 0; // Frame pointer
+                self.slots[i].context.x30 = thread_start as *const () as u64;
+                self.slots[i].context.sp = sp;
+                self.slots[i].context.daif = 0;
+                self.slots[i].context.elr = 0;
+                self.slots[i].context.spsr = 0;
 
-                self.slots[i] = ThreadSlot {
-                    state: ThreadState::Ready,
-                    context: ctx,
-                    cooperative,
-                    start_time_us: 0,
-                    timeout_us: if cooperative {
-                        COOPERATIVE_TIMEOUT_US
-                    } else {
-                        0
-                    },
+                // Write slot metadata
+                self.slots[i].cooperative = cooperative;
+                self.slots[i].start_time_us = 0;
+                self.slots[i].timeout_us = if cooperative {
+                    COOPERATIVE_TIMEOUT_US
+                } else {
+                    0
                 };
+
+                // Set state last (makes thread visible to scheduler)
+                self.slots[i].state = ThreadState::Ready;
 
                 return Ok(i);
             }
@@ -299,6 +311,7 @@ impl ThreadPool {
     }
 
     /// Select next ready thread (round-robin)
+    /// Thread 0 (boot/main) is a regular thread that can be scheduled
     pub fn schedule_indices(&mut self, voluntary: bool) -> Option<(usize, usize)> {
         let current_idx = self.current_idx;
         let current = &self.slots[current_idx];
@@ -317,25 +330,17 @@ impl ThreadPool {
             }
         }
 
-        // Find next ready thread
+        // Find next ready thread (including thread 0)
         let mut next_idx = (current_idx + 1) % MAX_THREADS;
-        if next_idx == 0 {
-            next_idx = 1;
-        } // Skip idle
         let start_idx = next_idx;
 
         loop {
-            if next_idx != 0 {
-                let state = self.slots[next_idx].state;
-                if state == ThreadState::Ready || state == ThreadState::Running {
-                    break;
-                }
+            let state = self.slots[next_idx].state;
+            if state == ThreadState::Ready || state == ThreadState::Running {
+                break;
             }
 
             next_idx = (next_idx + 1) % MAX_THREADS;
-            if next_idx == 0 {
-                next_idx = 1;
-            }
 
             if next_idx == start_idx {
                 return None; // No ready threads

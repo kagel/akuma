@@ -17,11 +17,8 @@ mod timer;
 mod virtio_hal;
 
 use alloc::string::ToString;
-use alloc::vec::Vec;
 
 use core::panic::PanicInfo;
-use fdt::Fdt;
-use fdt::FdtError;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -38,10 +35,8 @@ fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
-static PROMPT: &str = "Akuma >: ";
-
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
+pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
     const RAM_BASE: usize = 0x40000000;
 
     // DTB pointer workaround: QEMU with -device loader puts DTB at 0x44000000
@@ -136,20 +131,10 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
     irq::register_handler(30, |irq| timer::timer_irq_handler(irq));
 
     console::print("Enabling timer...\n");
-    timer::enable_timer_interrupts(10_000); // 10ms intervals (cleanup every tick)
+    timer::enable_timer_interrupts(10_000); // 10ms intervals
     console::print("Preemptive scheduling enabled (10ms timer -> SGI)\n");
 
-    // Test allocator
-    let mut test_vec: Vec<u32> = Vec::new();
-    for i in 0..10 {
-        test_vec.push(i);
-    }
-    test_vec.remove(0);
-    test_vec.insert(0, 99);
-    drop(test_vec);
-    console::print("Allocator OK\n");
-
-    // Run system tests
+    // Run system tests (includes allocator tests)
     if !tests::run_all() {
         console::print("\n!!! SYSTEM TESTS FAILED - HALTING !!!\n");
         loop {
@@ -159,177 +144,30 @@ pub extern "C" fn rust_start(mut dtb_ptr: usize) -> ! {
         }
     }
 
-    // Heartbeat thread - prints '.' every ~1s to show scheduling works
-    extern "C" fn heartbeat_thread() -> ! {
-        let mut count: u32 = 0;
-        loop {
-            // Busy delay
-            for _ in 0..5_000_000 {
-                unsafe { core::arch::asm!("nop") };
-            }
-            count += 1;
-            if count % 20 == 0 {
-                console::print(".");
-            }
-        }
-    }
-
-    // Network initialization thread with 5s timeout
+    // Network thread - cooperative, yields when appropriate
     extern "C" fn network_thread() -> ! {
-        let start_us = timer::uptime_us();
-
-        console::print("\n[Net] Starting (5s timeout)...\n");
-        console::print(&alloc::format!(
-            "[Net] Thread ID: {}\n",
-            threading::current_thread_id()
-        ));
+        console::print("[Net] Starting...\n");
 
         match network::init(0) {
-            Ok(()) => console::print("[Net] SUCCESS!\n"),
+            Ok(()) => console::print("[Net] Initialized\n"),
             Err(e) => console::print(&alloc::format!("[Net] Failed: {}\n", e)),
         }
 
-        let elapsed_ms = (timer::uptime_us() - start_us) / 1000;
-        console::print(&alloc::format!("[Net] Done in {}ms\n", elapsed_ms));
-
-        threading::mark_current_terminated();
-        threading::yield_now();
-
+        // Network main loop - poll and yield
         loop {
-            unsafe { core::arch::asm!("wfi") };
+            network::poll();
+            threading::yield_now();
         }
     }
 
-    // Spawn threads
-    console::print("Spawning heartbeat thread...\n");
-    threading::spawn(heartbeat_thread).expect("Failed to spawn heartbeat thread");
-    console::print("Heartbeat thread spawned\n");
-
-    // Network thread - cooperative (only yields voluntarily)
+    // Spawn network as cooperative thread
+    console::print("Spawning network thread (cooperative)...\n");
     threading::spawn_cooperative(network_thread).expect("Failed to spawn network thread");
-    console::print("Network thread spawned (cooperative)\n");
+    console::print("Network thread spawned\n");
 
-    let mut should_exit = false;
-    let mut buffer = Vec::new();
-    let mut prompt_shown = false;
-
-    while should_exit == false {
-        // No executor - threads run preemptively via timer IRQ
-
-        // Show prompt if we're ready for input
-        if !prompt_shown && buffer.is_empty() {
-            console::print(PROMPT);
-            prompt_shown = true;
-        }
-
-        // Check for input (non-blocking)
-        if console::has_char() {
-            let c = console::getchar();
-            buffer.push(c);
-            console::print(&(c as char).to_string());
-
-            // Process line when Enter is pressed
-            if c == b'\n' || c == b'\r' {
-                console::print("\n");
-                prompt_shown = false;
-
-                if let Ok(text) = core::str::from_utf8(&buffer[..buffer.len() - 1]) {
-                    match text.trim().to_lowercase().as_str() {
-                        "exit" => {
-                            console::print_as_akuma("MEOWWWW!");
-                            should_exit = true;
-                        }
-                        "meow" => {
-                            console::print_as_akuma("Meow");
-                        }
-                        "time" => {
-                            console::print("UTC: ");
-                            console::print(&timer::utc_iso8601());
-                            console::print("\nUptime: ");
-                            console::print(&(timer::uptime_us() / 1_000_000).to_string());
-                            console::print(" seconds\n");
-                        }
-                        "uptime" => {
-                            let uptime_sec = timer::uptime_us() / 1_000_000;
-                            let days = uptime_sec / 86400;
-                            let hours = (uptime_sec % 86400) / 3600;
-                            let minutes = (uptime_sec % 3600) / 60;
-                            let seconds = uptime_sec % 60;
-                            console::print("Uptime: ");
-                            console::print(&days.to_string());
-                            console::print(" days, ");
-                            console::print(&hours.to_string());
-                            console::print(":");
-                            console::print(&minutes.to_string());
-                            console::print(":");
-                            console::print(&seconds.to_string());
-                            console::print("\n");
-                        }
-                        "" => {
-                            // Empty line, just show prompt again
-                        }
-                        _ => {
-                            console::print_as_akuma("pffft");
-                        }
-                    }
-                }
-                buffer.clear();
-            }
-        }
-    }
-
-    // _start must never return (!) - hang forever
-    loop {}
-}
-
-fn detect_memory_size(dtb_addr: usize) -> Result<usize, &'static str> {
-    if dtb_addr == 0 {
-        return Err("DTB pointer is null");
-    }
-
-    unsafe {
-        match Fdt::from_ptr(dtb_addr as *const u8) {
-            Ok(fdt) => {
-                let total: usize = fdt
-                    .memory()
-                    .regions()
-                    .filter_map(|region| region.size)
-                    .sum();
-
-                if total == 0 {
-                    Err("No memory regions found in DTB")
-                } else {
-                    Ok(total)
-                }
-            }
-            Err(err) => Err(match err {
-                FdtError::BadMagic => "Bad FDT magic value",
-                FdtError::BadPtr => "Bad FDT pointer",
-                FdtError::BufferTooSmall => "Buffer too small",
-            }),
-        }
-    }
-}
-
-// Example async task - prints every 5 seconds
-async fn async_example_task() {
-    let mut counter = 0;
+    // Thread 0 becomes the idle loop - yield continuously
+    console::print("[Idle] Entering idle loop\n");
     loop {
-        executor::sleep_sec(5).await;
-        counter += 1;
-        console::print("[Async] Heartbeat #");
-        console::print(&counter.to_string());
-        console::print(" at ");
-        console::print(&timer::utc_iso8601_simple());
-        console::print("\n");
-    }
-}
-
-// Example network async task - polls every 100ms
-async fn async_network_task() {
-    loop {
-        executor::sleep_ms(100).await;
-        // Poll network stack
-        network::poll();
+        threading::yield_now();
     }
 }
