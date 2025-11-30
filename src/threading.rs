@@ -325,6 +325,8 @@ impl ThreadPool {
                 if elapsed < timeout {
                     return None; // Not timed out yet
                 }
+                // Debug: cooperative thread timed out
+                // crate::console::print("[SCHED] coop timeout\n");
             } else {
                 return None; // No timeout, can't preempt
             }
@@ -351,10 +353,9 @@ impl ThreadPool {
             return None;
         }
 
-        // Update states (thread 0 stays Running, never set to Ready)
-        if current_idx != IDLE_THREAD_IDX
-            && self.slots[current_idx].state != ThreadState::Terminated
-        {
+        // Update states - ALL threads get set to Ready when switching away
+        // (except terminated threads)
+        if self.slots[current_idx].state != ThreadState::Terminated {
             self.slots[current_idx].state = ThreadState::Ready;
         }
         self.slots[next_idx].state = ThreadState::Running;

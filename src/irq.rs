@@ -42,9 +42,14 @@ pub fn unregister_handler(irq: u32) {
 
 /// Dispatch an IRQ to its registered handler
 pub fn dispatch_irq(irq: u32) {
-    let handlers = IRQ_HANDLERS.lock();
+    // Copy the handler out while holding the lock, then call it without the lock
+    // This prevents deadlocks if the handler needs to register/unregister handlers
+    let handler = {
+        let handlers = IRQ_HANDLERS.lock();
+        handlers.handlers.get(irq as usize).copied().flatten()
+    };
 
-    if let Some(Some(handler)) = handlers.handlers.get(irq as usize) {
+    if let Some(handler) = handler {
         handler(irq);
     }
 }

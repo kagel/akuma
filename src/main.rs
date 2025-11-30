@@ -116,17 +116,29 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
     console::print(&(timer::uptime_us() / 1_000_000).to_string());
     console::print(" seconds\n");
 
-    // Initialize threading (IRQs still enabled, timer not yet configured)
+    // Initialize threading (but don't enable timer yet!)
     console::print("Initializing threading...\n");
     threading::init();
     console::print("Threading system initialized\n");
 
-    // Enable timer-driven preemptive multitasking via SGI
-    // 1. Enable SGI 0 for scheduling (SGIs are always enabled, but register a dummy handler)
+    // =========================================================================
+    // Initialize network BEFORE enabling preemptive scheduling
+    // This ensures VirtIO device setup completes without interruption
+    // =========================================================================
+    console::print("\n--- Network Initialization (pre-scheduler) ---\n");
+    match network::init(0) {
+        Ok(()) => console::print("[Net] Initialized successfully\n"),
+        Err(e) => console::print(&alloc::format!("[Net] Failed: {}\n", e)),
+    }
+    network::list_interfaces();
+    console::print("--- Network initialization complete ---\n\n");
+
+    // =========================================================================
+    // Now enable preemptive scheduling (timer interrupts)
+    // =========================================================================
     console::print("Configuring scheduler SGI...\n");
     gic::enable_irq(gic::SGI_SCHEDULER);
 
-    // 2. Timer IRQ (PPI 14, maps to IRQ 30) will trigger the SGI
     console::print("Registering timer IRQ...\n");
     irq::register_handler(30, |irq| timer::timer_irq_handler(irq));
 
@@ -144,28 +156,35 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
         }
     }
 
-    // Network thread - cooperative, yields when appropriate
-    extern "C" fn network_thread() -> ! {
-        console::print("[Net] Starting...\n");
-
-        match network::init(0) {
-            Ok(()) => console::print("[Net] Initialized\n"),
-            Err(e) => console::print(&alloc::format!("[Net] Failed: {}\n", e)),
-        }
-
-        // Network main loop - poll and yield
+    // Network polling thread - just polls, init is already done
+    extern "C" fn network_poll_thread() -> ! {
+        console::print("[Net] Poll thread started\n");
         loop {
-            network::poll();
+            let _packets = network::poll();
             threading::yield_now();
         }
     }
 
-    // Spawn network as cooperative thread
-    console::print("Spawning network thread (cooperative)...\n");
-    threading::spawn_cooperative(network_thread).expect("Failed to spawn network thread");
-    console::print("Network thread spawned\n");
+    // Spawn network polling as cooperative thread
+    console::print("Spawning network poll thread...\n");
+    let net_tid =
+        threading::spawn_cooperative(network_poll_thread).expect("Failed to spawn network thread");
+    console::print("Network poll thread spawned with tid=");
+    console::print(&net_tid.to_string());
+    console::print("\n");
 
-    // Thread 0 becomes the idle loop - yield continuously
+    while !network::is_ready() {
+        threading::yield_now();
+    }
+
+    console::print("Network is ready\n");
+
+    network::list_interfaces();
+
+    // console::print("Enabling IRQ interrupts for other threads\n");
+    // enable irq interrupts for other threads here
+
+    // Thread 0 becomes the idle loop
     console::print("[Idle] Entering idle loop\n");
     loop {
         threading::yield_now();
