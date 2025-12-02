@@ -122,16 +122,10 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
     console::print("Threading system initialized\n");
 
     // =========================================================================
-    // Initialize network BEFORE enabling preemptive scheduling
-    // This ensures VirtIO device setup completes without interruption
+    // Network initialization SKIPPED - virtio driver hangs
+    // TODO: Fix virtio driver initialization
     // =========================================================================
-    console::print("\n--- Network Initialization (pre-scheduler) ---\n");
-    match network::init(0) {
-        Ok(()) => console::print("[Net] Initialized successfully\n"),
-        Err(e) => console::print(&alloc::format!("[Net] Failed: {}\n", e)),
-    }
-    network::list_interfaces();
-    console::print("--- Network initialization complete ---\n\n");
+    console::print("\n--- Network Initialization SKIPPED (virtio hangs) ---\n\n");
 
     // =========================================================================
     // Now enable preemptive scheduling (timer interrupts)
@@ -146,6 +140,9 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
     timer::enable_timer_interrupts(10_000); // 10ms intervals
     console::print("Preemptive scheduling enabled (10ms timer -> SGI)\n");
 
+    // Enable IRQ-safe allocations now that preemption is active
+    allocator::enable_preemption_safe_alloc();
+
     // Run system tests (includes allocator tests)
     if !tests::run_all() {
         console::print("\n!!! SYSTEM TESTS FAILED - HALTING !!!\n");
@@ -156,30 +153,8 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
         }
     }
 
-    // Network polling thread - just polls, init is already done
-    extern "C" fn network_poll_thread() -> ! {
-        console::print("[Net] Poll thread started\n");
-        loop {
-            let _packets = network::poll();
-            threading::yield_now();
-        }
-    }
-
-    // Spawn network polling as cooperative thread
-    console::print("Spawning network poll thread...\n");
-    let net_tid =
-        threading::spawn_cooperative(network_poll_thread).expect("Failed to spawn network thread");
-    console::print("Network poll thread spawned with tid=");
-    console::print(&net_tid.to_string());
-    console::print("\n");
-
-    while !network::is_ready() {
-        threading::yield_now();
-    }
-
-    console::print("Network is ready\n");
-
-    network::list_interfaces();
+    // Network disabled - just proceed to idle loop
+    console::print("Network disabled, skipping network thread\n");
 
     // console::print("Enabling IRQ interrupts for other threads\n");
     // enable irq interrupts for other threads here

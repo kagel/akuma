@@ -7,6 +7,31 @@ static ALLOCATOR: Talck = Talck;
 
 static TALC: Spinlock<Talc<ErrOnOom>> = Spinlock::new(Talc::new(ErrOnOom));
 
+/// No-op for backwards compatibility - IRQs are now always disabled during allocation
+pub fn enable_preemption_safe_alloc() {}
+
+/// Run a closure with IRQs disabled to prevent context switch during allocation
+/// This is always enabled once preemption starts - we unconditionally disable IRQs
+/// because the check itself could race with preemption
+#[inline(never)]
+fn with_irqs_disabled<T, F: FnOnce() -> T>(f: F) -> T {
+    let daif: u64;
+    unsafe {
+        // Save current interrupt state
+        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
+        // Disable IRQs
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+        // Memory barrier to ensure IRQs are disabled before we proceed
+        core::arch::asm!("isb", options(nomem, nostack));
+    }
+    let result = f();
+    unsafe {
+        // Restore previous interrupt state
+        core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack));
+    }
+    result
+}
+
 pub fn init(heap_start: usize, heap_size: usize) -> Result<(), &'static str> {
     if heap_size == 0 {
         return Err("Heap size cannot be zero");
@@ -31,7 +56,8 @@ struct Talck;
 
 unsafe impl core::alloc::GlobalAlloc for Talck {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        unsafe {
+        // Always disable IRQs during allocation to prevent context switch deadlock
+        with_irqs_disabled(|| unsafe {
             let result = TALC
                 .lock()
                 .malloc(layout)
@@ -40,11 +66,11 @@ unsafe impl core::alloc::GlobalAlloc for Talck {
 
             // Log allocation failures - use only static strings to avoid recursion!
             if result.is_null() {
-                crate::console::print("\n[ALLOC FAIL]\n");
+                crate::console::print("[ALLOC FAIL]");
             }
 
             result
-        }
+        })
     }
 
     unsafe fn alloc_zeroed(&self, layout: core::alloc::Layout) -> *mut u8 {
@@ -58,10 +84,11 @@ unsafe impl core::alloc::GlobalAlloc for Talck {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
-        unsafe {
+        // Always disable IRQs during deallocation to prevent context switch deadlock
+        with_irqs_disabled(|| unsafe {
             TALC.lock()
                 .free(core::ptr::NonNull::new_unchecked(ptr), layout);
-        }
+        })
     }
 
     unsafe fn realloc(
