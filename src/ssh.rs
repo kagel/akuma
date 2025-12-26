@@ -21,7 +21,8 @@ use x25519_dalek::PublicKey as X25519PublicKey;
 
 use crate::akuma::AKUMA_79;
 use crate::console;
-use crate::network::{self, SshEvent};
+use crate::network;
+use crate::ssh_transport::{self, SshEvent};
 use crate::ssh_crypto::{
     build_encrypted_packet, build_packet, derive_key, read_string, read_u32, split_first_word,
     trim_bytes, write_namelist, write_string, write_u32, Aes128Ctr, CryptoState, HmacSha256,
@@ -306,7 +307,7 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
 // ============================================================================
 
 fn send_raw(data: &[u8]) {
-    network::ssh_send(data);
+    ssh_transport::send(data);
 }
 
 fn send_unencrypted_packet(payload: &[u8], session: &mut SshSession) {
@@ -425,7 +426,7 @@ fn handle_shell_input(session: &mut SshSession, data: &[u8]) {
                         send_packet(&close, session);
                         session.channel_open = false;
                         session.state = SshState::Disconnected;
-                        network::ssh_close();
+                        ssh_transport::close();
                         return;
                     }
                 }
@@ -451,7 +452,7 @@ fn handle_shell_input(session: &mut SshSession, data: &[u8]) {
                     send_packet(&close, session);
                     session.channel_open = false;
                     session.state = SshState::Disconnected;
-                    network::ssh_close();
+                    ssh_transport::close();
                 }
             }
             _ if byte >= 0x20 && byte < 0x7F => {
@@ -821,7 +822,7 @@ pub fn ssh_server_entry() -> ! {
     log("[SSH] Connect with: ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n");
 
     loop {
-        match network::poll_ssh() {
+        match ssh_transport::poll() {
             SshEvent::Connected => handle_connect(),
             SshEvent::Data(data) => handle_data(&data),
             SshEvent::Disconnected => handle_disconnect(),

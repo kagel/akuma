@@ -1,7 +1,12 @@
-// Network stack with TCP netcat-like server
-// Uses smoltcp for TCP/IP and virtio-net for the network device
-//
-// This version uses safe Rust with Box allocations instead of static mut
+//! Network stack with TCP/IP support
+//!
+//! Uses smoltcp for TCP/IP and virtio-net for the network device.
+//! This version uses safe Rust with Box allocations instead of static mut.
+//!
+//! Provides:
+//! - Core network device and interface management
+//! - SSH socket handling
+//! - Netcat socket handling (via netcat module)
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -18,7 +23,6 @@ use spinning_top::Spinlock;
 use virtio_drivers::device::net::VirtIONetRaw;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
-use crate::akuma::AKUMA_79;
 use crate::console;
 use crate::timer;
 use crate::virtio_hal::VirtioHal;
@@ -226,14 +230,14 @@ impl Device for VirtioNetDevice {
 // Network Stack State
 // ============================================================================
 
-struct NetStack {
-    device: VirtioNetDevice,
-    iface: Interface,
-    sockets: SocketSet<'static>,
-    tcp_handle: smoltcp::iface::SocketHandle,
-    ssh_handle: smoltcp::iface::SocketHandle,
-    was_connected: bool,
-    ssh_was_connected: bool,
+pub(crate) struct NetStack {
+    pub(crate) device: VirtioNetDevice,
+    pub(crate) iface: Interface,
+    pub(crate) sockets: SocketSet<'static>,
+    pub(crate) tcp_handle: smoltcp::iface::SocketHandle,
+    pub(crate) ssh_handle: smoltcp::iface::SocketHandle,
+    pub(crate) was_connected: bool,
+    pub(crate) ssh_was_connected: bool,
     // Note: TCP buffers and socket storage are leaked via Box::leak() for 'static lifetime
 }
 
@@ -430,189 +434,47 @@ fn get_time() -> Instant {
 }
 
 // ============================================================================
-// Network Polling & TCP Handler
+// Network Interface Polling
 // ============================================================================
 
-/// Poll the network stack - call this regularly from a thread
-/// Returns true if there was activity
-pub fn poll() -> bool {
-    let mut stack_guard = NET_STACK.lock();
-    let stack = match stack_guard.as_mut() {
-        Some(s) => s,
-        _ => return false,
-    };
-
-    let timestamp = get_time();
-
-    // Process network interface
-    let activity = stack
-        .iface
-        .poll(timestamp, &mut stack.device, &mut stack.sockets);
-
-    // Handle TCP socket
-    let socket = stack.sockets.get_mut::<TcpSocket>(stack.tcp_handle);
-
-    // Check for new connection
-    if socket.state() == TcpState::Established && !stack.was_connected {
-        stack.was_connected = true;
-        NET_STATS.lock().connections += 1;
-        drop(stack_guard);
-        log("\n[Net] *** Client connected! ***\n");
-        log("[Net] Type something and press Enter (echo server)\n");
-        log("[Net] Type 'quit' to disconnect\n\n");
-        return true;
-    } else if socket.state() == TcpState::Listen || socket.state() == TcpState::Closed {
-        stack.was_connected = false;
-    }
-
-    // Echo any received data back
-    if socket.can_recv() {
-        let mut buf = [0u8; 512];
-        match socket.recv_slice(&mut buf) {
-            Ok(len) if len > 0 => {
-                NET_STATS.lock().bytes_rx += len as u64;
-
-                // Check for 'quit' command
-                let data = &buf[..len];
-                if len >= 4 && (data.starts_with(b"quit") || data.starts_with(b"exit")) {
-                    let _ = socket.send_slice(b"Goodbye!\r\n");
-                    socket.close();
-                    drop(stack_guard);
-                    log("[Net] Client disconnected (quit)\n");
-                    return true;
-                }
-
-                if len >= 3 && data.starts_with(b"cat") {
-                    let _ = socket.send_slice(AKUMA_79);
-                    NET_STATS.lock().bytes_tx += AKUMA_79.len() as u64;
-                    return true;
-                }
-
-                // Echo back with prefix
-                if socket.can_send() {
-                    let _ = socket.send_slice(b"echo: ");
-                    let _ = socket.send_slice(&buf[..len]);
-                    NET_STATS.lock().bytes_tx += 6 + len as u64;
-                }
-                return true;
-            }
-            _ => {}
-        }
-    }
-
-    // Re-listen if socket closed
-    if socket.state() == TcpState::Closed {
-        let _ = socket.listen(LISTEN_PORT);
-    }
-
-    activity
-}
-
-// ============================================================================
-// SSH Socket Polling
-// ============================================================================
-
-/// SSH connection event returned by poll_ssh
-pub enum SshEvent {
-    /// No event
-    None,
-    /// New connection established
-    Connected,
-    /// Data received (contains the data)
-    Data(Vec<u8>),
-    /// Connection closed
-    Disconnected,
-}
-
-/// Poll the SSH socket and return any events
-/// This is called by the SSH module to handle the transport layer
-pub fn poll_ssh() -> SshEvent {
-    let mut stack_guard = NET_STACK.lock();
-    let stack = match stack_guard.as_mut() {
-        Some(s) => s,
-        _ => return SshEvent::None,
-    };
-
-    let timestamp = get_time();
-
-    // Process network interface
-    stack
-        .iface
-        .poll(timestamp, &mut stack.device, &mut stack.sockets);
-
-    // Handle SSH socket
-    let socket = stack.sockets.get_mut::<TcpSocket>(stack.ssh_handle);
-
-    // Check for new connection
-    if socket.state() == TcpState::Established && !stack.ssh_was_connected {
-        stack.ssh_was_connected = true;
-        NET_STATS.lock().connections += 1;
-        return SshEvent::Connected;
-    }
-
-    // Check for disconnect - handle all non-established states when we were connected
-    let state = socket.state();
-    if stack.ssh_was_connected && state != TcpState::Established {
-        stack.ssh_was_connected = false;
-        // Abort and re-listen to ensure socket is ready for new connections
-        socket.abort();
-        let _ = socket.listen(SSH_PORT);
-        return SshEvent::Disconnected;
-    }
-
-    // Check for received data
-    if socket.can_recv() {
-        let mut buf = [0u8; 512];
-        match socket.recv_slice(&mut buf) {
-            Ok(len) if len > 0 => {
-                NET_STATS.lock().bytes_rx += len as u64;
-                return SshEvent::Data(buf[..len].to_vec());
-            }
-            _ => {}
-        }
-    }
-
-    SshEvent::None
-}
-
-/// Send data on the SSH socket
-pub fn ssh_send(data: &[u8]) -> bool {
-    let mut stack_guard = NET_STACK.lock();
-    let stack = match stack_guard.as_mut() {
-        Some(s) => s,
-        _ => return false,
-    };
-
-    let socket = stack.sockets.get_mut::<TcpSocket>(stack.ssh_handle);
-    if socket.can_send() {
-        match socket.send_slice(data) {
-            Ok(len) => {
-                NET_STATS.lock().bytes_tx += len as u64;
-                return true;
-            }
-            Err(_) => return false,
-        }
-    }
-    false
-}
-
-/// Close the SSH connection and prepare for new connections
-pub fn ssh_close() {
+/// Poll only the network interface (not sockets)
+/// Call this before handling individual sockets
+pub fn poll_interface() {
     let mut stack_guard = NET_STACK.lock();
     let stack = match stack_guard.as_mut() {
         Some(s) => s,
         _ => return,
     };
 
-    let socket = stack.sockets.get_mut::<TcpSocket>(stack.ssh_handle);
+    let timestamp = get_time();
+    stack
+        .iface
+        .poll(timestamp, &mut stack.device, &mut stack.sockets);
+}
 
-    // Abort the connection to immediately reset the socket state
-    // This avoids getting stuck in TIME_WAIT or other intermediate states
-    socket.abort();
-    stack.ssh_was_connected = false;
+/// Execute a closure with access to the network stack
+/// Returns None if the network stack is not initialized
+pub fn with_netstack<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut NetStack) -> R,
+{
+    let mut stack_guard = NET_STACK.lock();
+    stack_guard.as_mut().map(f)
+}
 
-    // Re-listen immediately
-    let _ = socket.listen(SSH_PORT);
+/// Increment the connection counter
+pub fn increment_connections() {
+    NET_STATS.lock().connections += 1;
+}
+
+/// Add to bytes received counter
+pub fn add_bytes_rx(bytes: u64) {
+    NET_STATS.lock().bytes_rx += bytes;
+}
+
+/// Add to bytes transmitted counter
+pub fn add_bytes_tx(bytes: u64) {
+    NET_STATS.lock().bytes_tx += bytes;
 }
 
 /// Get network statistics: (connections, bytes_rx, bytes_tx)
@@ -624,16 +486,6 @@ pub fn get_stats() -> (u64, u64, u64) {
 // ============================================================================
 // Public API
 // ============================================================================
-
-/// Thread entry point for network server
-pub fn netcat_server_entry() -> ! {
-    log("[Net] Netcat server thread started\n");
-
-    loop {
-        poll();
-        crate::threading::yield_now();
-    }
-}
 
 /// Print network statistics
 pub fn stats() {

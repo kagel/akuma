@@ -12,9 +12,11 @@ mod exceptions;
 mod executor;
 mod gic;
 mod irq;
+mod netcat;
 mod network;
 mod ssh;
 mod ssh_crypto;
+mod ssh_transport;
 mod tests;
 mod threading;
 mod timer;
@@ -173,7 +175,7 @@ fn kernel_main() -> ! {
             console::print("[Net] Starting network server thread...\n");
 
             // Spawn network handler thread (telnet)
-            match threading::spawn_fn(network::netcat_server_entry) {
+            match threading::spawn_fn(netcat::netcat_server_entry) {
                 Ok(tid) => console::print(&alloc::format!(
                     "[Net] Telnet server thread started (tid={})\n",
                     tid
