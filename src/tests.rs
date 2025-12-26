@@ -1211,18 +1211,15 @@ fn test_spawn_thread() -> bool {
     let count_before = threading::thread_count();
     console::print(&format!("  Threads before: {}\n", count_before));
 
-    // Simple thread that just marks itself terminated immediately
-    extern "C" fn test_thread_immediate() -> ! {
+    // Try to spawn - simple thread that just marks itself terminated immediately
+    console::print("  Spawning test thread...");
+    match threading::spawn_fn(|| {
         threading::mark_current_terminated();
         loop {
             threading::yield_now();
             unsafe { core::arch::asm!("wfi") };
         }
-    }
-
-    // Try to spawn
-    console::print("  Spawning test thread...");
-    match threading::spawn(test_thread_immediate) {
+    }) {
         Ok(tid) => {
             console::print(&format!(" OK (tid={})\n", tid));
 
@@ -1248,18 +1245,16 @@ fn test_spawn_and_run() -> bool {
     // Reset flag
     set_test_flag(false);
 
-    // Thread that sets the flag and terminates
-    extern "C" fn test_thread_sets_flag() -> ! {
+    // Spawn thread that sets the flag and terminates
+    console::print("  Spawning thread that sets flag...");
+    match threading::spawn_fn(|| {
         set_test_flag(true);
         threading::mark_current_terminated();
         loop {
             threading::yield_now();
             unsafe { core::arch::asm!("wfi") };
         }
-    }
-
-    console::print("  Spawning thread that sets flag...");
-    match threading::spawn(test_thread_sets_flag) {
+    }) {
         Ok(tid) => {
             console::print(&format!(" OK (tid={})\n", tid));
 
@@ -1299,17 +1294,15 @@ fn test_spawn_and_cleanup() -> bool {
     let count_before = threading::thread_count();
     console::print(&format!("  Threads before: {}\n", count_before));
 
-    extern "C" fn test_thread_terminates() -> ! {
+    // Spawn thread
+    console::print("  Spawning...");
+    let _tid = match threading::spawn_fn(|| {
         threading::mark_current_terminated();
         loop {
             threading::yield_now();
             unsafe { core::arch::asm!("wfi") };
         }
-    }
-
-    // Spawn thread
-    console::print("  Spawning...");
-    let _tid = match threading::spawn(test_thread_terminates) {
+    }) {
         Ok(t) => {
             console::print(&format!(" tid={}\n", t));
             t
@@ -1376,21 +1369,19 @@ fn test_spawn_multiple() -> bool {
     let count_before = threading::thread_count();
     console::print(&format!("  Threads before: {}\n", count_before));
 
-    extern "C" fn counter_thread() -> ! {
-        increment_counter();
-        threading::mark_current_terminated();
-        loop {
-            threading::yield_now();
-            unsafe { core::arch::asm!("wfi") };
-        }
-    }
-
     // Spawn 3 threads
     const NUM_THREADS: usize = 3;
     console::print(&format!("  Spawning {} threads...", NUM_THREADS));
 
     for i in 0..NUM_THREADS {
-        match threading::spawn(counter_thread) {
+        match threading::spawn_fn(|| {
+            increment_counter();
+            threading::mark_current_terminated();
+            loop {
+                threading::yield_now();
+                unsafe { core::arch::asm!("wfi") };
+            }
+        }) {
             Ok(_) => {}
             Err(e) => {
                 console::print(&format!(" FAILED at {}: {}\n", i, e));
@@ -1459,7 +1450,8 @@ fn test_spawn_and_yield() -> bool {
 
     reset_yield_count();
 
-    extern "C" fn yielding_thread() -> ! {
+    console::print("  Spawning yielding thread...");
+    match threading::spawn_fn(|| {
         // Yield 5 times, incrementing counter each time
         for _ in 0..5 {
             increment_yield_count();
@@ -1470,10 +1462,7 @@ fn test_spawn_and_yield() -> bool {
             threading::yield_now();
             unsafe { core::arch::asm!("wfi") };
         }
-    }
-
-    console::print("  Spawning yielding thread...");
-    match threading::spawn(yielding_thread) {
+    }) {
         Ok(tid) => console::print(&format!(" tid={}\n", tid)),
         Err(e) => {
             console::print(&format!(" FAILED: {}\n", e));
@@ -1505,17 +1494,15 @@ fn test_spawn_cooperative() -> bool {
 
     set_test_flag(false);
 
-    extern "C" fn coop_thread() -> ! {
+    console::print("  Spawning cooperative thread...");
+    match threading::spawn_fn_cooperative(|| {
         set_test_flag(true);
         threading::mark_current_terminated();
         loop {
             threading::yield_now();
             unsafe { core::arch::asm!("wfi") };
         }
-    }
-
-    console::print("  Spawning cooperative thread...");
-    match threading::spawn_cooperative(coop_thread) {
+    }) {
         Ok(tid) => console::print(&format!(" tid={}\n", tid)),
         Err(e) => {
             console::print(&format!(" FAILED: {}\n", e));
@@ -1576,7 +1563,8 @@ fn test_yield_cycle() -> bool {
 
     const CYCLES: u32 = 10;
 
-    extern "C" fn cycle_thread() -> ! {
+    console::print(&format!("  Spawning thread for {} yield cycles...", CYCLES));
+    match threading::spawn_fn(|| {
         // Perform multiple yield-resume cycles
         for _ in 0..CYCLES {
             increment_yield_cycle();
@@ -1587,10 +1575,7 @@ fn test_yield_cycle() -> bool {
             threading::yield_now();
             unsafe { core::arch::asm!("wfi") };
         }
-    }
-
-    console::print(&format!("  Spawning thread for {} yield cycles...", CYCLES));
-    match threading::spawn(cycle_thread) {
+    }) {
         Ok(tid) => console::print(&format!(" tid={}\n", tid)),
         Err(e) => {
             console::print(&format!(" FAILED: {}\n", e));
@@ -1669,8 +1654,9 @@ fn test_mixed_cooperative_preemptible() -> bool {
     let count_before = threading::thread_count();
     console::print(&format!("  Threads before: {}\n", count_before));
 
-    // Cooperative thread: yields for ~5ms total
-    extern "C" fn cooperative_5ms_thread() -> ! {
+    // Spawn cooperative thread: yields for ~5ms total
+    console::print("  Spawning cooperative thread (5ms)...");
+    match threading::spawn_fn_cooperative(|| {
         let start = crate::timer::uptime_us();
         let target = 5_000; // 5ms
 
@@ -1684,10 +1670,17 @@ fn test_mixed_cooperative_preemptible() -> bool {
             threading::yield_now();
             unsafe { core::arch::asm!("wfi") };
         }
+    }) {
+        Ok(tid) => console::print(&format!(" tid={}\n", tid)),
+        Err(e) => {
+            console::print(&format!(" FAILED: {}\n", e));
+            return false;
+        }
     }
 
-    // Preemptible thread: busy-loops for ~15ms
-    extern "C" fn preemptible_15ms_thread() -> ! {
+    // Spawn preemptible thread: busy-loops for ~15ms
+    console::print("  Spawning preemptible thread (15ms)...");
+    match threading::spawn_fn(|| {
         let start = crate::timer::uptime_us();
         let target = 15_000; // 15ms
 
@@ -1703,21 +1696,7 @@ fn test_mixed_cooperative_preemptible() -> bool {
             threading::yield_now();
             unsafe { core::arch::asm!("wfi") };
         }
-    }
-
-    // Spawn cooperative thread
-    console::print("  Spawning cooperative thread (5ms)...");
-    match threading::spawn_cooperative(cooperative_5ms_thread) {
-        Ok(tid) => console::print(&format!(" tid={}\n", tid)),
-        Err(e) => {
-            console::print(&format!(" FAILED: {}\n", e));
-            return false;
-        }
-    }
-
-    // Spawn preemptible thread
-    console::print("  Spawning preemptible thread (15ms)...");
-    match threading::spawn(preemptible_15ms_thread) {
+    }) {
         Ok(tid) => console::print(&format!(" tid={}\n", tid)),
         Err(e) => {
             console::print(&format!(" FAILED: {}\n", e));

@@ -464,9 +464,8 @@ pub fn poll() -> bool {
 // Public API
 // ============================================================================
 
-/// Thread entry point for network server (must be extern "C" fn() -> ! for threading)
-#[unsafe(no_mangle)]
-pub extern "C" fn netcat_server_entry() -> ! {
+/// Thread entry point for network server
+pub fn netcat_server_entry() -> ! {
     log("[Net] Netcat server thread started\n");
     
     loop {

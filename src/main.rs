@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(never_type)]
 
 extern crate alloc;
 
@@ -169,7 +170,7 @@ fn kernel_main() -> ! {
             console::print("[Net] Starting network server thread...\n");
             
             // Spawn network handler thread
-            match threading::spawn(network::netcat_server_entry) {
+            match threading::spawn_fn(network::netcat_server_entry) {
                 Ok(tid) => console::print(&alloc::format!("[Net] Server thread started (tid={})\n", tid)),
                 Err(e) => {
                     console::print("[Net] Failed to spawn server thread: ");

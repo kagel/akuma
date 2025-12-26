@@ -1,6 +1,7 @@
 // Preemptive threading with fixed-size thread pool
 // No dynamic allocation during spawn/cleanup - all memory pre-allocated at init
 
+use alloc::boxed::Box;
 use core::arch::global_asm;
 use spinning_top::Spinlock;
 
@@ -94,7 +95,7 @@ switch_context:
     // Return
     ret
 
-// Thread entry trampoline
+// Thread entry trampoline for extern "C" functions
 // x19 holds the actual thread entry function
 thread_start:
     // Enable IRQs for this thread
@@ -107,6 +108,22 @@ thread_start:
     // (This shouldn't happen for -> ! functions, but just in case)
     b thread_exit_asm
 
+// Thread entry trampoline for Rust closures
+// x19 holds pointer to the closure trampoline function
+// x20 holds the raw pointer to the boxed closure data
+thread_start_closure:
+    // Enable IRQs for this thread
+    msr daifclr, #2
+    
+    // Call the trampoline with closure pointer as argument
+    // x19 = trampoline function pointer
+    // x20 = closure data pointer (passed as x0)
+    mov x0, x20
+    blr x19
+    
+    // Thread returned - should not happen for -> ! closures
+    b thread_exit_asm
+
 thread_exit_asm:
     wfi
     b thread_exit_asm
@@ -117,6 +134,7 @@ thread_exit_asm:
 unsafe extern "C" {
     fn switch_context(old: *mut Context, new: *const Context);
     fn thread_start() -> !;
+    fn thread_start_closure() -> !;
 }
 
 /// CPU context saved during context switch
@@ -233,7 +251,7 @@ impl ThreadPool {
         self.initialized = true;
     }
 
-    /// Spawn a new thread
+    /// Spawn a new thread with extern "C" entry function
     pub fn spawn(
         &mut self,
         entry: extern "C" fn() -> !,
@@ -281,6 +299,62 @@ impl ThreadPool {
                 };
 
                 // Set state last (makes thread visible to scheduler)
+                self.slots[i].state = ThreadState::Ready;
+
+                return Ok(i);
+            }
+        }
+
+        Err("No free thread slots")
+    }
+
+    /// Spawn a new thread with a boxed closure
+    /// trampoline_fn: function that takes raw closure pointer and calls it
+    /// closure_ptr: raw pointer to the boxed closure
+    pub fn spawn_closure(
+        &mut self,
+        trampoline_fn: fn(*mut ()) -> !,
+        closure_ptr: *mut (),
+        cooperative: bool,
+    ) -> Result<usize, &'static str> {
+        if !self.initialized {
+            return Err("Thread pool not initialized");
+        }
+
+        // Find first free slot (skip slot 0 = idle)
+        for i in 1..MAX_THREADS {
+            if self.slots[i].state == ThreadState::Free {
+                let stack_base = self.stacks[i];
+                let stack_top = stack_base + STACK_SIZE;
+                let sp = (stack_top & !0xF) as u64;
+
+                // x19 = trampoline function pointer
+                // x20 = closure data pointer
+                self.slots[i].context.x19 = trampoline_fn as *const () as u64;
+                self.slots[i].context.x20 = closure_ptr as u64;
+                self.slots[i].context.x21 = 0;
+                self.slots[i].context.x22 = 0;
+                self.slots[i].context.x23 = 0;
+                self.slots[i].context.x24 = 0;
+                self.slots[i].context.x25 = 0;
+                self.slots[i].context.x26 = 0;
+                self.slots[i].context.x27 = 0;
+                self.slots[i].context.x28 = 0;
+                self.slots[i].context.x29 = 0;
+                self.slots[i].context.x30 = thread_start_closure as *const () as u64;
+                self.slots[i].context.sp = sp;
+                self.slots[i].context.daif = 0;
+                self.slots[i].context.elr = 0;
+                self.slots[i].context.spsr = 0;
+
+                self.slots[i].cooperative = cooperative;
+                self.slots[i].start_time_us = 0;
+                self.slots[i].timeout_us = if cooperative {
+                    COOPERATIVE_TIMEOUT_US
+                } else {
+                    0
+                };
+
                 self.slots[i].state = ThreadState::Ready;
 
                 return Ok(i);
@@ -407,17 +481,17 @@ pub fn init() {
     pool.init();
 }
 
-/// Spawn a new preemptible thread
+/// Spawn a new preemptible thread with extern "C" entry
 pub fn spawn(entry: extern "C" fn() -> !) -> Result<usize, &'static str> {
     spawn_with_options(entry, false)
 }
 
-/// Spawn a cooperative thread (only yields voluntarily)
+/// Spawn a cooperative thread (only yields voluntarily) with extern "C" entry
 pub fn spawn_cooperative(entry: extern "C" fn() -> !) -> Result<usize, &'static str> {
     spawn_with_options(entry, true)
 }
 
-/// Spawn with options
+/// Spawn with options (extern "C" entry)
 pub fn spawn_with_options(
     entry: extern "C" fn() -> !,
     cooperative: bool,
@@ -426,6 +500,69 @@ pub fn spawn_with_options(
         let mut pool = POOL.lock();
         pool.spawn(entry, cooperative)
     })
+}
+
+/// Trampoline function that calls a boxed FnOnce closure
+/// Called from assembly with the closure pointer in x0
+fn closure_trampoline<F: FnOnce() -> ! + Send + 'static>(closure_ptr: *mut ()) -> ! {
+    // SAFETY: The pointer was created from Box::into_raw in spawn_fn
+    // and is only called once (the thread runs the closure and never returns)
+    let closure = unsafe { Box::from_raw(closure_ptr as *mut F) };
+    closure()
+}
+
+/// Spawn a new preemptible thread with a Rust closure
+/// 
+/// # Example
+/// ```
+/// spawn_fn(|| {
+///     loop {
+///         // thread work
+///         yield_now();
+///     }
+/// })
+/// ```
+pub fn spawn_fn<F>(f: F) -> Result<usize, &'static str>
+where
+    F: FnOnce() -> ! + Send + 'static,
+{
+    spawn_fn_with_options(f, false)
+}
+
+/// Spawn a cooperative thread with a Rust closure
+pub fn spawn_fn_cooperative<F>(f: F) -> Result<usize, &'static str>
+where
+    F: FnOnce() -> ! + Send + 'static,
+{
+    spawn_fn_with_options(f, true)
+}
+
+/// Spawn a thread with a Rust closure and options
+pub fn spawn_fn_with_options<F>(f: F, cooperative: bool) -> Result<usize, &'static str>
+where
+    F: FnOnce() -> ! + Send + 'static,
+{
+    // Box the closure and get a raw pointer
+    let boxed: Box<F> = Box::new(f);
+    let closure_ptr = Box::into_raw(boxed) as *mut ();
+    
+    // Get the trampoline function for this specific closure type
+    let trampoline: fn(*mut ()) -> ! = closure_trampoline::<F>;
+
+    let result = with_irqs_disabled(|| {
+        let mut pool = POOL.lock();
+        pool.spawn_closure(trampoline, closure_ptr, cooperative)
+    });
+
+    // If spawn failed, we need to clean up the boxed closure
+    if result.is_err() {
+        // SAFETY: We just created this pointer and spawn failed, so we own it
+        unsafe {
+            let _ = Box::from_raw(closure_ptr as *mut F);
+        }
+    }
+
+    result
 }
 
 /// SGI handler for scheduling
