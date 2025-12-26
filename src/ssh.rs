@@ -364,7 +364,14 @@ fn execute_command(line: &[u8]) -> Vec<u8> {
             response.extend_from_slice(b"\r\n");
         }
         b"cat" => {
-            response.extend_from_slice(AKUMA_79);
+            // Convert \n to \r\n for proper SSH terminal display
+            for &byte in AKUMA_79 {
+                if byte == b'\n' {
+                    response.extend_from_slice(b"\r\n");
+                } else {
+                    response.push(byte);
+                }
+            }
             if !AKUMA_79.ends_with(b"\n") {
                 response.extend_from_slice(b"\r\n");
             }
