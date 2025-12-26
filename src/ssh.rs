@@ -14,9 +14,8 @@ use alloc::vec;
 use core::convert::TryInto;
 use spinning_top::Spinlock;
 
-use curve25519_dalek::scalar::Scalar;
-use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
 use ed25519_dalek::{SigningKey, Signer, SECRET_KEY_LENGTH};
+use x25519_dalek::PublicKey as X25519PublicKey;
 use hmac::Mac;
 use sha2::{Sha256, Digest};
 
@@ -176,21 +175,21 @@ fn build_kexinit(rng: &mut SimpleRng) -> Vec<u8> {
 // ============================================================================
 
 fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Option<Vec<u8>> {
-    let mut scalar_bytes = [0u8; 32];
-    session.rng.fill_bytes(&mut scalar_bytes);
-    scalar_bytes[0] &= 248;
-    scalar_bytes[31] &= 127;
-    scalar_bytes[31] |= 64;
+    // Generate server ephemeral key pair using X25519
+    let mut secret_bytes = [0u8; 32];
+    session.rng.fill_bytes(&mut secret_bytes);
     
-    let server_scalar = Scalar::from_bytes_mod_order(scalar_bytes);
-    let server_pubkey = (ED25519_BASEPOINT_POINT * server_scalar).compress().to_bytes();
+    let server_secret = x25519_dalek::StaticSecret::from(secret_bytes);
+    let server_public = X25519PublicKey::from(&server_secret);
+    let server_pubkey = server_public.as_bytes();
     
-    let client_point_bytes: [u8; 32] = client_pubkey.try_into().ok()?;
+    // Parse client's X25519 public key
+    let client_pubkey_bytes: [u8; 32] = client_pubkey.try_into().ok()?;
+    let client_public = X25519PublicKey::from(client_pubkey_bytes);
     
-    use curve25519_dalek::edwards::CompressedEdwardsY;
-    let client_point = CompressedEdwardsY(client_point_bytes).decompress()?;
-    let shared_point = (client_point * server_scalar).compress().to_bytes();
-    let shared_secret = shared_point.to_vec();
+    // Compute shared secret via ECDH
+    let shared_secret_point = server_secret.diffie_hellman(&client_public);
+    let shared_secret = shared_secret_point.as_bytes().to_vec();
     
     let host_key = session.host_key.as_ref()?;
     let host_pubkey = host_key.verifying_key().to_bytes();
@@ -206,7 +205,7 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
     write_string(&mut hash_data, &session.server_kexinit);
     write_string(&mut hash_data, &host_key_blob);
     write_string(&mut hash_data, client_pubkey);
-    write_string(&mut hash_data, &server_pubkey);
+    write_string(&mut hash_data, server_pubkey);
     
     // K as mpint
     if !shared_secret.is_empty() && shared_secret[0] & 0x80 != 0 {
@@ -255,7 +254,7 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
     let mut reply = Vec::new();
     reply.push(SSH_MSG_KEX_ECDH_REPLY);
     write_string(&mut reply, &host_key_blob);
-    write_string(&mut reply, &server_pubkey);
+    write_string(&mut reply, server_pubkey);
     write_string(&mut reply, &sig_blob);
     
     Some(reply)
