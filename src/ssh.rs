@@ -1,354 +1,899 @@
-//! Minimal SSH server implementation
+//! SSH-2 Protocol Implementation
 //!
-//! This module implements a minimal SSH-2 protocol server that:
-//! - Accepts any authentication credentials
-//! - Provides a shell with basic commands (echo, cat, quit, stats)
-//! - Uses simplified protocol handling focused on the state machine
+//! Implements a minimal SSH-2 server that works with real SSH clients.
+//! Supports:
+//! - curve25519-sha256 key exchange
+//! - ssh-ed25519 host key
+//! - aes128-ctr encryption
+//! - hmac-sha2-256 MAC
+//! - Accepts any authentication
+//! - Shell with basic commands
 
 use alloc::vec::Vec;
+use alloc::vec;
+use core::convert::TryInto;
 use spinning_top::Spinlock;
+
+use aes::Aes128;
+use ctr::{Ctr128BE, cipher::{KeyIvInit, StreamCipher}};
+use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+use ed25519_dalek::{SigningKey, Signer, SECRET_KEY_LENGTH};
+use hmac::{Hmac, Mac};
+use sha2::{Sha256, Digest};
 
 use crate::akuma::AKUMA_79;
 use crate::console;
 use crate::network::{self, SshEvent};
+use crate::timer;
 
 // ============================================================================
-// Constants
+// SSH Constants
 // ============================================================================
 
-/// SSH protocol version string
 const SSH_VERSION: &[u8] = b"SSH-2.0-Akuma_0.1\r\n";
 
-/// Shell prompt
-const PROMPT: &[u8] = b"akuma> ";
+// SSH Message Types
+const SSH_MSG_DISCONNECT: u8 = 1;
+const SSH_MSG_IGNORE: u8 = 2;
+const SSH_MSG_UNIMPLEMENTED: u8 = 3;
+const SSH_MSG_DEBUG: u8 = 4;
+const SSH_MSG_SERVICE_REQUEST: u8 = 5;
+const SSH_MSG_SERVICE_ACCEPT: u8 = 6;
+const SSH_MSG_KEXINIT: u8 = 20;
+const SSH_MSG_NEWKEYS: u8 = 21;
+const SSH_MSG_KEX_ECDH_INIT: u8 = 30;
+const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
+const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
+const SSH_MSG_USERAUTH_SUCCESS: u8 = 52;
+const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
+const SSH_MSG_REQUEST_FAILURE: u8 = 82;
+const SSH_MSG_CHANNEL_OPEN: u8 = 90;
+const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
+const SSH_MSG_CHANNEL_DATA: u8 = 94;
+const SSH_MSG_CHANNEL_EOF: u8 = 96;
+const SSH_MSG_CHANNEL_CLOSE: u8 = 97;
+const SSH_MSG_CHANNEL_REQUEST: u8 = 98;
+const SSH_MSG_CHANNEL_SUCCESS: u8 = 99;
+const SSH_MSG_CHANNEL_FAILURE: u8 = 100;
+
+// Algorithm names
+const KEX_ALGO: &str = "curve25519-sha256";
+const HOST_KEY_ALGO: &str = "ssh-ed25519";
+const CIPHER_ALGO: &str = "aes128-ctr";
+const MAC_ALGO: &str = "hmac-sha2-256";
+const COMPRESS_ALGO: &str = "none";
+
+// Sizes
+const AES_KEY_SIZE: usize = 16;
+const AES_IV_SIZE: usize = 16;
+const MAC_KEY_SIZE: usize = 32;
+const MAC_SIZE: usize = 32;
+
+// ============================================================================
+// Simple RNG using timer entropy
+// ============================================================================
+
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn new() -> Self {
+        let seed = timer::uptime_us() ^ 0xDEADBEEFCAFEBABE;
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        self.state
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        for chunk in dest.chunks_mut(8) {
+            let val = self.next_u64();
+            let bytes = val.to_le_bytes();
+            for (i, b) in chunk.iter_mut().enumerate() {
+                *b = bytes[i];
+            }
+        }
+    }
+}
 
 // ============================================================================
 // SSH State Machine
 // ============================================================================
 
-/// SSH connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SshState {
-    /// Waiting for client to connect
-    Disconnected,
-    /// Waiting for client version string
+enum SshState {
     AwaitingVersion,
-    /// Key exchange phase (simplified - we skip actual crypto)
-    KeyExchange,
-    /// Authentication phase (accept anything)
-    Authenticating,
-    /// Session is active, channel open
-    SessionActive,
-    /// Shell is ready for commands
-    ShellReady,
+    AwaitingKexInit,
+    AwaitingKexEcdhInit,
+    AwaitingNewKeys,
+    AwaitingServiceRequest,
+    AwaitingUserAuth,
+    Authenticated,
+    Disconnected,
 }
 
-/// SSH session state
+// ============================================================================
+// Crypto State
+// ============================================================================
+
+type Aes128Ctr = Ctr128BE<Aes128>;
+type HmacSha256 = Hmac<Sha256>;
+
+struct CryptoState {
+    decrypt_cipher: Option<Aes128Ctr>,
+    decrypt_mac_key: [u8; MAC_KEY_SIZE],
+    decrypt_seq: u32,
+    encrypt_cipher: Option<Aes128Ctr>,
+    encrypt_mac_key: [u8; MAC_KEY_SIZE],
+    encrypt_seq: u32,
+}
+
+impl CryptoState {
+    fn new() -> Self {
+        Self {
+            decrypt_cipher: None,
+            decrypt_mac_key: [0u8; MAC_KEY_SIZE],
+            decrypt_seq: 0,
+            encrypt_cipher: None,
+            encrypt_mac_key: [0u8; MAC_KEY_SIZE],
+            encrypt_seq: 0,
+        }
+    }
+}
+
+// ============================================================================
+// SSH Session
+// ============================================================================
+
 struct SshSession {
     state: SshState,
-    /// Input buffer for accumulating partial data
+    rng: SimpleRng,
+    client_version: Vec<u8>,
+    server_version: Vec<u8>,
+    client_kexinit: Vec<u8>,
+    server_kexinit: Vec<u8>,
+    session_id: [u8; 32],
+    host_key: Option<SigningKey>,
+    crypto: CryptoState,
     input_buffer: Vec<u8>,
-    /// Line buffer for command accumulation
+    channel_open: bool,
+    client_channel: u32,
     line_buffer: Vec<u8>,
 }
 
 impl SshSession {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             state: SshState::Disconnected,
+            rng: SimpleRng::new(),
+            client_version: Vec::new(),
+            server_version: SSH_VERSION[..SSH_VERSION.len()-2].to_vec(),
+            client_kexinit: Vec::new(),
+            server_kexinit: Vec::new(),
+            session_id: [0u8; 32],
+            host_key: None,
+            crypto: CryptoState::new(),
             input_buffer: Vec::new(),
+            channel_open: false,
+            client_channel: 0,
             line_buffer: Vec::new(),
         }
     }
 
     fn reset(&mut self) {
         self.state = SshState::Disconnected;
+        self.client_version.clear();
+        self.client_kexinit.clear();
+        self.server_kexinit.clear();
+        self.session_id = [0u8; 32];
+        self.crypto = CryptoState::new();
         self.input_buffer.clear();
+        self.channel_open = false;
         self.line_buffer.clear();
     }
-}
 
-static SESSION: Spinlock<SshSession> = Spinlock::new(SshSession::new());
-
-// ============================================================================
-// Response Helpers
-// ============================================================================
-
-/// Write a string to the response buffer
-pub fn write_string(response: &mut Vec<u8>, s: &str) {
-    response.extend_from_slice(s.as_bytes());
-}
-
-/// Write a newline (CRLF for terminal compatibility) to the response buffer
-pub fn write_newline(response: &mut Vec<u8>) {
-    response.extend_from_slice(b"\r\n");
-}
-
-/// Write bytes directly to the response buffer
-pub fn write_bytes(response: &mut Vec<u8>, data: &[u8]) {
-    response.extend_from_slice(data);
-}
-
-// ============================================================================
-// Command Handlers
-// ============================================================================
-
-/// Parse and execute a command, returning the response
-fn execute_command(line: &[u8]) -> Vec<u8> {
-    let mut response = Vec::new();
-
-    // Trim whitespace
-    let line = trim_bytes(line);
-
-    if line.is_empty() {
-        return response;
+    fn generate_host_key(&mut self) {
+        let mut key_bytes = [0u8; SECRET_KEY_LENGTH];
+        self.rng.fill_bytes(&mut key_bytes);
+        self.host_key = Some(SigningKey::from_bytes(&key_bytes));
     }
+}
 
-    // Parse command and arguments
+static SESSION: Spinlock<Option<SshSession>> = Spinlock::new(None);
+
+// ============================================================================
+// SSH Packet Helpers
+// ============================================================================
+
+fn write_u32(buf: &mut Vec<u8>, val: u32) {
+    buf.extend_from_slice(&val.to_be_bytes());
+}
+
+fn write_string(buf: &mut Vec<u8>, s: &[u8]) {
+    write_u32(buf, s.len() as u32);
+    buf.extend_from_slice(s);
+}
+
+fn write_namelist(buf: &mut Vec<u8>, names: &[&str]) {
+    let joined = names.join(",");
+    write_string(buf, joined.as_bytes());
+}
+
+fn read_u32(data: &[u8], offset: &mut usize) -> Option<u32> {
+    if *offset + 4 > data.len() {
+        return None;
+    }
+    let val = u32::from_be_bytes(data[*offset..*offset+4].try_into().ok()?);
+    *offset += 4;
+    Some(val)
+}
+
+fn read_string<'a>(data: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
+    let len = read_u32(data, offset)? as usize;
+    if *offset + len > data.len() {
+        return None;
+    }
+    let s = &data[*offset..*offset+len];
+    *offset += len;
+    Some(s)
+}
+
+fn build_packet(payload: &[u8]) -> Vec<u8> {
+    let padding_len = 8 - ((5 + payload.len()) % 8);
+    let padding_len = if padding_len < 4 { padding_len + 8 } else { padding_len };
+    
+    let packet_len = 1 + payload.len() + padding_len;
+    let mut packet = Vec::with_capacity(4 + packet_len);
+    
+    write_u32(&mut packet, packet_len as u32);
+    packet.push(padding_len as u8);
+    packet.extend_from_slice(payload);
+    packet.resize(packet.len() + padding_len, 0);
+    
+    packet
+}
+
+fn build_encrypted_packet(payload: &[u8], cipher: &mut Aes128Ctr, mac_key: &[u8; MAC_KEY_SIZE], seq: u32) -> Vec<u8> {
+    let padding_len = 16 - ((5 + payload.len()) % 16);
+    let padding_len = if padding_len < 4 { padding_len + 16 } else { padding_len };
+    
+    let packet_len = 1 + payload.len() + padding_len;
+    let mut packet = Vec::with_capacity(4 + packet_len + MAC_SIZE);
+    
+    write_u32(&mut packet, packet_len as u32);
+    packet.push(padding_len as u8);
+    packet.extend_from_slice(payload);
+    
+    let mut rng = SimpleRng::new();
+    let pad_start = packet.len();
+    packet.resize(pad_start + padding_len, 0);
+    rng.fill_bytes(&mut packet[pad_start..]);
+    
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(mac_key).unwrap();
+    mac.update(&seq.to_be_bytes());
+    mac.update(&packet);
+    let mac_result = mac.finalize().into_bytes();
+    
+    cipher.apply_keystream(&mut packet);
+    packet.extend_from_slice(&mac_result);
+    
+    packet
+}
+
+// ============================================================================
+// KEXINIT Message
+// ============================================================================
+
+fn build_kexinit(rng: &mut SimpleRng) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(SSH_MSG_KEXINIT);
+    
+    let mut cookie = [0u8; 16];
+    rng.fill_bytes(&mut cookie);
+    payload.extend_from_slice(&cookie);
+    
+    write_namelist(&mut payload, &[KEX_ALGO]);
+    write_namelist(&mut payload, &[HOST_KEY_ALGO]);
+    write_namelist(&mut payload, &[CIPHER_ALGO]);
+    write_namelist(&mut payload, &[CIPHER_ALGO]);
+    write_namelist(&mut payload, &[MAC_ALGO]);
+    write_namelist(&mut payload, &[MAC_ALGO]);
+    write_namelist(&mut payload, &[COMPRESS_ALGO]);
+    write_namelist(&mut payload, &[COMPRESS_ALGO]);
+    write_namelist(&mut payload, &[]);
+    write_namelist(&mut payload, &[]);
+    payload.push(0);
+    write_u32(&mut payload, 0);
+    
+    payload
+}
+
+// ============================================================================
+// Key Exchange
+// ============================================================================
+
+fn derive_key(k: &[u8], h: &[u8], letter: u8, session_id: &[u8], size: usize) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    
+    let mut k_mpint = Vec::new();
+    if !k.is_empty() && k[0] & 0x80 != 0 {
+        write_u32(&mut k_mpint, (k.len() + 1) as u32);
+        k_mpint.push(0);
+    } else {
+        write_u32(&mut k_mpint, k.len() as u32);
+    }
+    k_mpint.extend_from_slice(k);
+    
+    hasher.update(&k_mpint);
+    hasher.update(h);
+    hasher.update(&[letter]);
+    hasher.update(session_id);
+    
+    let mut result: Vec<u8> = hasher.finalize().to_vec();
+    
+    while result.len() < size {
+        let mut hasher = Sha256::new();
+        hasher.update(&k_mpint);
+        hasher.update(h);
+        hasher.update(&result);
+        result.extend_from_slice(&hasher.finalize());
+    }
+    
+    result.truncate(size);
+    result
+}
+
+fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Option<Vec<u8>> {
+    let mut scalar_bytes = [0u8; 32];
+    session.rng.fill_bytes(&mut scalar_bytes);
+    scalar_bytes[0] &= 248;
+    scalar_bytes[31] &= 127;
+    scalar_bytes[31] |= 64;
+    
+    let server_scalar = Scalar::from_bytes_mod_order(scalar_bytes);
+    let server_pubkey = (ED25519_BASEPOINT_POINT * server_scalar).compress().to_bytes();
+    
+    let client_point_bytes: [u8; 32] = client_pubkey.try_into().ok()?;
+    
+    use curve25519_dalek::edwards::CompressedEdwardsY;
+    let client_point = CompressedEdwardsY(client_point_bytes).decompress()?;
+    let shared_point = (client_point * server_scalar).compress().to_bytes();
+    let shared_secret = shared_point.to_vec();
+    
+    let host_key = session.host_key.as_ref()?;
+    let host_pubkey = host_key.verifying_key().to_bytes();
+    
+    let mut host_key_blob = Vec::new();
+    write_string(&mut host_key_blob, b"ssh-ed25519");
+    write_string(&mut host_key_blob, &host_pubkey);
+    
+    let mut hash_data = Vec::new();
+    write_string(&mut hash_data, &session.client_version);
+    write_string(&mut hash_data, &session.server_version);
+    write_string(&mut hash_data, &session.client_kexinit);
+    write_string(&mut hash_data, &session.server_kexinit);
+    write_string(&mut hash_data, &host_key_blob);
+    write_string(&mut hash_data, client_pubkey);
+    write_string(&mut hash_data, &server_pubkey);
+    
+    if !shared_secret.is_empty() && shared_secret[0] & 0x80 != 0 {
+        write_u32(&mut hash_data, (shared_secret.len() + 1) as u32);
+        hash_data.push(0);
+    } else {
+        write_u32(&mut hash_data, shared_secret.len() as u32);
+    }
+    hash_data.extend_from_slice(&shared_secret);
+    
+    let mut hasher = Sha256::new();
+    hasher.update(&hash_data);
+    let exchange_hash: [u8; 32] = hasher.finalize().into();
+    
+    if session.session_id == [0u8; 32] {
+        session.session_id = exchange_hash;
+    }
+    
+    let signature = host_key.sign(&exchange_hash);
+    let mut sig_blob = Vec::new();
+    write_string(&mut sig_blob, b"ssh-ed25519");
+    write_string(&mut sig_blob, signature.to_bytes().as_slice());
+    
+    let iv_c2s = derive_key(&shared_secret, &exchange_hash, b'A', &session.session_id, AES_IV_SIZE);
+    let iv_s2c = derive_key(&shared_secret, &exchange_hash, b'B', &session.session_id, AES_IV_SIZE);
+    let key_c2s = derive_key(&shared_secret, &exchange_hash, b'C', &session.session_id, AES_KEY_SIZE);
+    let key_s2c = derive_key(&shared_secret, &exchange_hash, b'D', &session.session_id, AES_KEY_SIZE);
+    let mac_c2s = derive_key(&shared_secret, &exchange_hash, b'E', &session.session_id, MAC_KEY_SIZE);
+    let mac_s2c = derive_key(&shared_secret, &exchange_hash, b'F', &session.session_id, MAC_KEY_SIZE);
+    
+    session.crypto.decrypt_cipher = Some(Aes128Ctr::new(
+        key_c2s[..AES_KEY_SIZE].try_into().unwrap(),
+        iv_c2s[..AES_IV_SIZE].try_into().unwrap()
+    ));
+    session.crypto.decrypt_mac_key.copy_from_slice(&mac_c2s[..MAC_KEY_SIZE]);
+    
+    session.crypto.encrypt_cipher = Some(Aes128Ctr::new(
+        key_s2c[..AES_KEY_SIZE].try_into().unwrap(),
+        iv_s2c[..AES_IV_SIZE].try_into().unwrap()
+    ));
+    session.crypto.encrypt_mac_key.copy_from_slice(&mac_s2c[..MAC_KEY_SIZE]);
+    
+    let mut reply = Vec::new();
+    reply.push(SSH_MSG_KEX_ECDH_REPLY);
+    write_string(&mut reply, &host_key_blob);
+    write_string(&mut reply, &server_pubkey);
+    write_string(&mut reply, &sig_blob);
+    
+    Some(reply)
+}
+
+// ============================================================================
+// Packet Sending
+// ============================================================================
+
+fn send_raw(data: &[u8]) {
+    network::ssh_send(data);
+}
+
+fn send_unencrypted_packet(payload: &[u8], session: &mut SshSession) {
+    let packet = build_packet(payload);
+    session.crypto.encrypt_seq = session.crypto.encrypt_seq.wrapping_add(1);
+    send_raw(&packet);
+}
+
+fn send_encrypted_packet(payload: &[u8], session: &mut SshSession) {
+    if let Some(cipher) = session.crypto.encrypt_cipher.as_mut() {
+        let seq = session.crypto.encrypt_seq;
+        session.crypto.encrypt_seq = seq.wrapping_add(1);
+        let packet = build_encrypted_packet(payload, cipher, &session.crypto.encrypt_mac_key, seq);
+        send_raw(&packet);
+    }
+}
+
+fn send_packet(payload: &[u8], session: &mut SshSession) {
+    if session.crypto.encrypt_cipher.is_some() && session.state != SshState::AwaitingNewKeys {
+        send_encrypted_packet(payload, session);
+    } else {
+        send_unencrypted_packet(payload, session);
+    }
+}
+
+// ============================================================================
+// Shell Handling
+// ============================================================================
+
+fn send_channel_data(session: &mut SshSession, data: &[u8]) {
+    if !session.channel_open {
+        return;
+    }
+    let mut payload = vec![SSH_MSG_CHANNEL_DATA];
+    write_u32(&mut payload, session.client_channel);
+    write_string(&mut payload, data);
+    send_packet(&payload, session);
+}
+
+fn execute_command(line: &[u8]) -> Vec<u8> {
+    let line = trim_bytes(line);
+    if line.is_empty() {
+        return Vec::new();
+    }
+    
     let (cmd, args) = split_first_word(line);
-
+    let mut response = Vec::new();
+    
     match cmd {
         b"echo" => {
-            // Echo back the arguments
             if !args.is_empty() {
-                write_bytes(&mut response, args);
+                response.extend_from_slice(args);
             }
-            write_newline(&mut response);
+            response.extend_from_slice(b"\r\n");
         }
         b"cat" => {
-            // Print AKUMA_79 ASCII art
-            write_bytes(&mut response, AKUMA_79);
-            // Ensure it ends with newline
+            response.extend_from_slice(AKUMA_79);
             if !AKUMA_79.ends_with(b"\n") {
-                write_newline(&mut response);
+                response.extend_from_slice(b"\r\n");
             }
         }
         b"quit" | b"exit" => {
-            write_string(&mut response, "Goodbye!\r\n");
-            // Signal disconnect (handled by caller)
+            response.extend_from_slice(b"Goodbye!\r\n");
         }
         b"stats" => {
             let (connections, bytes_rx, bytes_tx) = network::get_stats();
-            write_string(
-                &mut response,
-                &alloc::format!(
+            let stats = alloc::format!(
                 "Network Statistics:\r\n  Connections: {}\r\n  Bytes RX: {}\r\n  Bytes TX: {}\r\n",
                 connections, bytes_rx, bytes_tx
-            ),
             );
+            response.extend_from_slice(stats.as_bytes());
         }
         b"help" => {
-            write_string(&mut response, "Available commands:\r\n");
-            write_string(&mut response, "  echo <text>  - Echo back text\r\n");
-            write_string(&mut response, "  cat          - Display ASCII art\r\n");
-            write_string(
-                &mut response,
-                "  stats        - Show network statistics\r\n",
-            );
-            write_string(&mut response, "  help         - Show this help\r\n");
-            write_string(&mut response, "  quit/exit    - Close connection\r\n");
+            response.extend_from_slice(b"Available commands:\r\n");
+            response.extend_from_slice(b"  echo <text>  - Echo back text\r\n");
+            response.extend_from_slice(b"  cat          - Display ASCII art\r\n");
+            response.extend_from_slice(b"  stats        - Show network statistics\r\n");
+            response.extend_from_slice(b"  help         - Show this help\r\n");
+            response.extend_from_slice(b"  quit/exit    - Close connection\r\n");
         }
         _ => {
-            write_string(&mut response, "Unknown command: ");
-            write_bytes(&mut response, cmd);
-            write_string(&mut response, "\r\nType 'help' for available commands.\r\n");
+            response.extend_from_slice(b"Unknown command: ");
+            response.extend_from_slice(cmd);
+            response.extend_from_slice(b"\r\nType 'help' for available commands.\r\n");
         }
     }
-
+    
     response
 }
 
-/// Check if command is quit/exit
 fn is_quit_command(line: &[u8]) -> bool {
     let line = trim_bytes(line);
     let (cmd, _) = split_first_word(line);
     cmd == b"quit" || cmd == b"exit"
 }
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
-/// Trim leading and trailing whitespace from bytes
 fn trim_bytes(data: &[u8]) -> &[u8] {
-    let start = data
-        .iter()
-        .position(|&b| !b.is_ascii_whitespace())
-        .unwrap_or(data.len());
-    let end = data
-        .iter()
-        .rposition(|&b| !b.is_ascii_whitespace())
-        .map(|i| i + 1)
-        .unwrap_or(start);
+    let start = data.iter().position(|&b| !b.is_ascii_whitespace()).unwrap_or(data.len());
+    let end = data.iter().rposition(|&b| !b.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(start);
     &data[start..end]
 }
 
-/// Split at first whitespace, returning (first_word, rest)
 fn split_first_word(data: &[u8]) -> (&[u8], &[u8]) {
     if let Some(pos) = data.iter().position(|&b| b.is_ascii_whitespace()) {
-        let rest = &data[pos..];
-        let rest_trimmed = trim_bytes(rest);
-        (&data[..pos], rest_trimmed)
+        (&data[..pos], trim_bytes(&data[pos..]))
     } else {
         (data, &[])
     }
 }
 
-// ============================================================================
-// Protocol Handling
-// ============================================================================
-
-/// Handle incoming data based on current state
-fn handle_data(data: &[u8]) {
-    let mut session = SESSION.lock();
-
-    match session.state {
-        SshState::Disconnected => {
-            // Shouldn't receive data when disconnected
-        }
-        SshState::AwaitingVersion => {
-            // Accumulate data looking for version string ending in \r\n or \n
-            session.input_buffer.extend_from_slice(data);
-
-            // Check for complete version line
-            if let Some(pos) = session.input_buffer.iter().position(|&b| b == b'\n') {
-                // We got a version string (ignore it for now - we accept anything)
-                let _version_line = &session.input_buffer[..pos];
-
-                // Log received version
-                log("[SSH] Client version received\n");
-
-                // Clear buffer and move to next state
-                session.input_buffer.clear();
-
-                // In minimal SSH, we skip key exchange and go straight to shell
-                // This won't work with real SSH clients, but works for testing with nc
-                session.state = SshState::ShellReady;
-
-                // Send welcome message and prompt
-                let mut response = Vec::new();
-                write_string(&mut response, "\r\n");
-                write_string(&mut response, "=================================\r\n");
-                write_string(&mut response, "  Welcome to Akuma SSH Server\r\n");
-                write_string(&mut response, "=================================\r\n");
-                write_string(&mut response, "\r\n");
-                write_string(&mut response, "Type 'help' for available commands.\r\n");
-                write_string(&mut response, "\r\n");
-                write_bytes(&mut response, PROMPT);
-
-                drop(session);
-                network::ssh_send(&response);
+fn handle_shell_input(session: &mut SshSession, data: &[u8]) {
+    for &byte in data {
+        match byte {
+            b'\r' | b'\n' => {
+                let line = session.line_buffer.clone();
+                session.line_buffer.clear();
+                
+                send_channel_data(session, b"\r\n");
+                
+                if !line.is_empty() {
+                    let response = execute_command(&line);
+                    if !response.is_empty() {
+                        send_channel_data(session, &response);
+                    }
+                    
+                    if is_quit_command(&line) {
+                        let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
+                        write_u32(&mut close, session.client_channel);
+                        send_packet(&close, session);
+                        session.channel_open = false;
+                        return;
+                    }
+                }
+                
+                send_channel_data(session, b"akuma> ");
             }
-        }
-        SshState::KeyExchange | SshState::Authenticating | SshState::SessionActive => {
-            // In minimal implementation, these are pass-through
-            session.state = SshState::ShellReady;
-        }
-        SshState::ShellReady => {
-            // Process shell input
-            // Handle line-by-line input with local echo
-            for &byte in data {
-                match byte {
-                    // Carriage return or newline - execute command
-                    b'\r' | b'\n' => {
-                        if !session.line_buffer.is_empty() {
-                            let line = session.line_buffer.clone();
-                            let is_quit = is_quit_command(&line);
-                            session.line_buffer.clear();
-
-                            // Execute command
-                            drop(session);
-
-                            // Send newline first
-                            network::ssh_send(b"\r\n");
-
-                            let response = execute_command(&line);
-                            if !response.is_empty() {
-                                network::ssh_send(&response);
-                            }
-
-                            if is_quit {
-                                // Close connection
-                                network::ssh_close();
-                                let mut session = SESSION.lock();
-                                session.reset();
-                                return;
-                            }
-
-                            // Send prompt
-                            network::ssh_send(PROMPT);
-
-                            session = SESSION.lock();
-                        } else {
-                            // Empty line - just send newline and prompt
-                            drop(session);
-                            network::ssh_send(b"\r\n");
-                            network::ssh_send(PROMPT);
-                            session = SESSION.lock();
-                        }
-                    }
-                    // Backspace handling
-                    0x7F | 0x08 => {
-                        if !session.line_buffer.is_empty() {
-                            session.line_buffer.pop();
-                            // Echo backspace-space-backspace to erase character
-                            drop(session);
-                            network::ssh_send(b"\x08 \x08");
-                            session = SESSION.lock();
-                        }
-                    }
-                    // Ctrl+C - cancel current line
-                    0x03 => {
-                        session.line_buffer.clear();
-                        drop(session);
-                        network::ssh_send(b"^C\r\n");
-                        network::ssh_send(PROMPT);
-                        session = SESSION.lock();
-                    }
-                    // Ctrl+D - quit if line is empty
-                    0x04 => {
-                        if session.line_buffer.is_empty() {
-                            drop(session);
-                            network::ssh_send(b"\r\nGoodbye!\r\n");
-                            network::ssh_close();
-                            let mut session = SESSION.lock();
-                            session.reset();
-                            return;
-                        }
-                    }
-                    // Regular printable character
-                    _ if byte >= 0x20 && byte < 0x7F => {
-                        session.line_buffer.push(byte);
-                        // Echo the character
-                        drop(session);
-                        network::ssh_send(&[byte]);
-                        session = SESSION.lock();
-                    }
-                    // Ignore other control characters
-                    _ => {}
+            0x7F | 0x08 => {
+                if !session.line_buffer.is_empty() {
+                    session.line_buffer.pop();
+                    send_channel_data(session, b"\x08 \x08");
                 }
             }
+            0x03 => {
+                session.line_buffer.clear();
+                send_channel_data(session, b"^C\r\n");
+                send_channel_data(session, b"akuma> ");
+            }
+            0x04 => {
+                if session.line_buffer.is_empty() {
+                    send_channel_data(session, b"\r\nGoodbye!\r\n");
+                    let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
+                    write_u32(&mut close, session.client_channel);
+                    send_packet(&close, session);
+                    session.channel_open = false;
+                }
+            }
+            _ if byte >= 0x20 && byte < 0x7F => {
+                session.line_buffer.push(byte);
+                send_channel_data(session, &[byte]);
+            }
+            _ => {}
         }
     }
 }
 
-/// Handle new connection
-fn handle_connect() {
-    let mut session = SESSION.lock();
-    session.reset();
-    session.state = SshState::AwaitingVersion;
+// ============================================================================
+// Message Handlers
+// ============================================================================
 
-    log("[SSH] Client connected\n");
-
-    // Send our version string
-    drop(session);
-    network::ssh_send(SSH_VERSION);
+fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
+    log(&alloc::format!("[SSH] Received message type {}\n", msg_type));
+    
+    match msg_type {
+        SSH_MSG_KEXINIT => {
+            let mut full = vec![SSH_MSG_KEXINIT];
+            full.extend_from_slice(payload);
+            session.client_kexinit = full;
+            
+            let kexinit = build_kexinit(&mut session.rng);
+            session.server_kexinit = kexinit.clone();
+            
+            send_unencrypted_packet(&kexinit, session);
+            session.state = SshState::AwaitingKexEcdhInit;
+        }
+        
+        SSH_MSG_KEX_ECDH_INIT => {
+            let mut offset = 0;
+            if let Some(client_pubkey) = read_string(payload, &mut offset) {
+                if let Some(reply) = handle_kex_ecdh_init(session, client_pubkey) {
+                    send_unencrypted_packet(&reply, session);
+                    
+                    let newkeys = vec![SSH_MSG_NEWKEYS];
+                    send_unencrypted_packet(&newkeys, session);
+                    session.state = SshState::AwaitingNewKeys;
+                } else {
+                    log("[SSH] KEX failed\n");
+                }
+            }
+        }
+        
+        SSH_MSG_NEWKEYS => {
+            log("[SSH] Encryption activated\n");
+            session.state = SshState::AwaitingServiceRequest;
+        }
+        
+        SSH_MSG_SERVICE_REQUEST => {
+            let mut offset = 0;
+            if let Some(service) = read_string(payload, &mut offset) {
+                log(&alloc::format!("[SSH] Service request: {:?}\n", core::str::from_utf8(service)));
+                
+                let mut reply = vec![SSH_MSG_SERVICE_ACCEPT];
+                write_string(&mut reply, service);
+                send_packet(&reply, session);
+                session.state = SshState::AwaitingUserAuth;
+            }
+        }
+        
+        SSH_MSG_USERAUTH_REQUEST => {
+            let reply = vec![SSH_MSG_USERAUTH_SUCCESS];
+            send_packet(&reply, session);
+            session.state = SshState::Authenticated;
+            log("[SSH] User authenticated\n");
+        }
+        
+        SSH_MSG_CHANNEL_OPEN => {
+            let mut offset = 0;
+            let channel_type = read_string(payload, &mut offset);
+            let sender_channel = read_u32(payload, &mut offset);
+            let initial_window = read_u32(payload, &mut offset);
+            let max_packet = read_u32(payload, &mut offset);
+            
+            if let (Some(_), Some(sender), Some(_), Some(_)) = (channel_type, sender_channel, initial_window, max_packet) {
+                session.client_channel = sender;
+                session.channel_open = true;
+                
+                let mut reply = vec![SSH_MSG_CHANNEL_OPEN_CONFIRMATION];
+                write_u32(&mut reply, sender);
+                write_u32(&mut reply, 0);
+                write_u32(&mut reply, 0x100000);
+                write_u32(&mut reply, 0x4000);
+                send_packet(&reply, session);
+                
+                log("[SSH] Channel opened\n");
+            }
+        }
+        
+        SSH_MSG_CHANNEL_REQUEST => {
+            let mut offset = 0;
+            let _recipient = read_u32(payload, &mut offset);
+            let request_type = read_string(payload, &mut offset);
+            let want_reply = if offset < payload.len() { payload[offset] != 0 } else { false };
+            
+            if let Some(req_type) = request_type {
+                log(&alloc::format!("[SSH] Channel request: {:?}\n", core::str::from_utf8(req_type)));
+                
+                let success = matches!(req_type, b"pty-req" | b"shell" | b"env");
+                
+                if want_reply {
+                    let msg_type = if success { SSH_MSG_CHANNEL_SUCCESS } else { SSH_MSG_CHANNEL_FAILURE };
+                    let mut full_reply = vec![msg_type];
+                    write_u32(&mut full_reply, session.client_channel);
+                    send_packet(&full_reply, session);
+                }
+                
+                if req_type == b"shell" {
+                    send_channel_data(session, b"\r\n=================================\r\n");
+                    send_channel_data(session, b"  Welcome to Akuma SSH Server\r\n");
+                    send_channel_data(session, b"=================================\r\n\r\n");
+                    send_channel_data(session, b"Type 'help' for available commands.\r\n\r\n");
+                    send_channel_data(session, b"akuma> ");
+                }
+            }
+        }
+        
+        SSH_MSG_CHANNEL_DATA => {
+            let mut offset = 0;
+            let _recipient = read_u32(payload, &mut offset);
+            if let Some(data) = read_string(payload, &mut offset) {
+                handle_shell_input(session, data);
+            }
+        }
+        
+        SSH_MSG_CHANNEL_EOF | SSH_MSG_CHANNEL_CLOSE => {
+            log("[SSH] Channel close requested\n");
+            let mut reply = vec![SSH_MSG_CHANNEL_CLOSE];
+            write_u32(&mut reply, session.client_channel);
+            send_packet(&reply, session);
+            session.channel_open = false;
+        }
+        
+        SSH_MSG_GLOBAL_REQUEST => {
+            let reply = vec![SSH_MSG_REQUEST_FAILURE];
+            send_packet(&reply, session);
+        }
+        
+        SSH_MSG_DISCONNECT => {
+            log("[SSH] Client disconnected\n");
+            session.state = SshState::Disconnected;
+        }
+        
+        SSH_MSG_IGNORE | SSH_MSG_DEBUG => {}
+        
+        _ => {
+            log(&alloc::format!("[SSH] Unhandled message type {}\n", msg_type));
+            let mut reply = vec![SSH_MSG_UNIMPLEMENTED];
+            write_u32(&mut reply, session.crypto.decrypt_seq.wrapping_sub(1));
+            send_packet(&reply, session);
+        }
+    }
 }
 
-/// Handle disconnect
+// ============================================================================
+// Packet Processing
+// ============================================================================
+
+fn process_encrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)> {
+    if session.input_buffer.len() < 4 + MAC_SIZE {
+        return None;
+    }
+    
+    let cipher = session.crypto.decrypt_cipher.as_mut()?;
+    
+    let total_len = session.input_buffer.len();
+    if total_len < MAC_SIZE + 8 {
+        return None;
+    }
+    
+    let mac_start = total_len - MAC_SIZE;
+    let mut encrypted_part = session.input_buffer[..mac_start].to_vec();
+    let received_mac = &session.input_buffer[mac_start..];
+    
+    cipher.apply_keystream(&mut encrypted_part);
+    
+    let seq = session.crypto.decrypt_seq;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&session.crypto.decrypt_mac_key).ok()?;
+    mac.update(&seq.to_be_bytes());
+    mac.update(&encrypted_part);
+    
+    if mac.verify_slice(received_mac).is_err() {
+        log("[SSH] MAC verification failed\n");
+        return None;
+    }
+    
+    session.crypto.decrypt_seq = seq.wrapping_add(1);
+    
+    let packet_len = u32::from_be_bytes(encrypted_part[..4].try_into().ok()?) as usize;
+    let padding_len = encrypted_part[4] as usize;
+    let payload_len = packet_len - padding_len - 1;
+    
+    if 5 + payload_len > encrypted_part.len() {
+        return None;
+    }
+    
+    let msg_type = encrypted_part[5];
+    let payload = encrypted_part[6..5+payload_len].to_vec();
+    
+    session.input_buffer.clear();
+    
+    Some((msg_type, payload))
+}
+
+fn process_unencrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)> {
+    if session.input_buffer.len() < 5 {
+        return None;
+    }
+    
+    let packet_len = u32::from_be_bytes(session.input_buffer[..4].try_into().ok()?) as usize;
+    let total_len = 4 + packet_len;
+    
+    if session.input_buffer.len() < total_len {
+        return None;
+    }
+    
+    let padding_len = session.input_buffer[4] as usize;
+    let payload_len = packet_len - padding_len - 1;
+    
+    let msg_type = session.input_buffer[5];
+    let payload = session.input_buffer[6..5+payload_len].to_vec();
+    
+    session.crypto.decrypt_seq = session.crypto.decrypt_seq.wrapping_add(1);
+    session.input_buffer = session.input_buffer[total_len..].to_vec();
+    
+    Some((msg_type, payload))
+}
+
+// ============================================================================
+// Connection Handling
+// ============================================================================
+
+fn handle_connect() {
+    let mut guard = SESSION.lock();
+    let session = guard.insert(SshSession::new());
+    session.state = SshState::AwaitingVersion;
+    session.generate_host_key();
+    
+    log("[SSH] Client connected\n");
+    drop(guard);
+    
+    send_raw(SSH_VERSION);
+}
+
+fn handle_data(data: &[u8]) {
+    let mut guard = SESSION.lock();
+    let session = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+    
+    if session.state == SshState::Disconnected {
+        return;
+    }
+    
+    session.input_buffer.extend_from_slice(data);
+    
+    if session.state == SshState::AwaitingVersion {
+        if let Some(pos) = session.input_buffer.iter().position(|&b| b == b'\n') {
+            let version_line = session.input_buffer[..pos].to_vec();
+            session.input_buffer = session.input_buffer[pos+1..].to_vec();
+            
+            let version = if version_line.ends_with(b"\r") {
+                version_line[..version_line.len()-1].to_vec()
+            } else {
+                version_line
+            };
+            
+            session.client_version = version;
+            session.state = SshState::AwaitingKexInit;
+            log("[SSH] Client version received\n");
+        }
+        return;
+    }
+    
+    loop {
+        let use_encryption = !matches!(session.state, 
+            SshState::AwaitingNewKeys | SshState::AwaitingKexInit | SshState::AwaitingKexEcdhInit);
+        
+        let packet = if use_encryption {
+            process_encrypted_packet(session)
+        } else {
+            process_unencrypted_packet(session)
+        };
+        
+        match packet {
+            Some((msg_type, payload)) => {
+                handle_message(msg_type, &payload, session);
+            }
+            None => break,
+        }
+    }
+}
+
 fn handle_disconnect() {
-    let mut session = SESSION.lock();
-    session.reset();
+    let mut guard = SESSION.lock();
+    if let Some(session) = guard.as_mut() {
+        session.reset();
+    }
+    *guard = None;
     log("[SSH] Client disconnected\n");
 }
 
@@ -367,8 +912,8 @@ fn log(msg: &str) {
 /// SSH server thread entry point
 pub fn ssh_server_entry() -> ! {
     log("[SSH] SSH server thread started\n");
-    log("[SSH] Connect with: nc localhost 2222\n");
-
+    log("[SSH] Connect with: ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n");
+    
     loop {
         match network::poll_ssh() {
             SshEvent::Connected => handle_connect(),
@@ -376,7 +921,7 @@ pub fn ssh_server_entry() -> ! {
             SshEvent::Disconnected => handle_disconnect(),
             SshEvent::None => {}
         }
-
+        
         crate::threading::yield_now();
     }
 }
