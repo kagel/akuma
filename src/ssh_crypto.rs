@@ -11,9 +11,9 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 
 use aes::Aes128;
-use ctr::{Ctr128BE, cipher::StreamCipher};
+use ctr::{cipher::StreamCipher, Ctr128BE};
 use hmac::{Hmac, Mac};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::timer;
 
@@ -117,7 +117,7 @@ pub fn read_u32(data: &[u8], offset: &mut usize) -> Option<u32> {
     if *offset + 4 > data.len() {
         return None;
     }
-    let val = u32::from_be_bytes(data[*offset..*offset+4].try_into().ok()?);
+    let val = u32::from_be_bytes(data[*offset..*offset + 4].try_into().ok()?);
     *offset += 4;
     Some(val)
 }
@@ -128,7 +128,7 @@ pub fn read_string<'a>(data: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
     if *offset + len > data.len() {
         return None;
     }
-    let s = &data[*offset..*offset+len];
+    let s = &data[*offset..*offset + len];
     *offset += len;
     Some(s)
 }
@@ -136,54 +136,62 @@ pub fn read_string<'a>(data: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
 /// Build an unencrypted SSH packet
 pub fn build_packet(payload: &[u8]) -> Vec<u8> {
     let padding_len = 8 - ((5 + payload.len()) % 8);
-    let padding_len = if padding_len < 4 { padding_len + 8 } else { padding_len };
-    
+    let padding_len = if padding_len < 4 {
+        padding_len + 8
+    } else {
+        padding_len
+    };
+
     let packet_len = 1 + payload.len() + padding_len;
     let mut packet = Vec::with_capacity(4 + packet_len);
-    
+
     write_u32(&mut packet, packet_len as u32);
     packet.push(padding_len as u8);
     packet.extend_from_slice(payload);
     packet.resize(packet.len() + padding_len, 0);
-    
+
     packet
 }
 
 /// Build an encrypted SSH packet with MAC
 pub fn build_encrypted_packet(
-    payload: &[u8], 
-    cipher: &mut Aes128Ctr, 
-    mac_key: &[u8; MAC_KEY_SIZE], 
-    seq: u32
+    payload: &[u8],
+    cipher: &mut Aes128Ctr,
+    mac_key: &[u8; MAC_KEY_SIZE],
+    seq: u32,
 ) -> Vec<u8> {
     let padding_len = 16 - ((5 + payload.len()) % 16);
-    let padding_len = if padding_len < 4 { padding_len + 16 } else { padding_len };
-    
+    let padding_len = if padding_len < 4 {
+        padding_len + 16
+    } else {
+        padding_len
+    };
+
     let packet_len = 1 + payload.len() + padding_len;
     let mut packet = Vec::with_capacity(4 + packet_len + MAC_SIZE);
-    
+
     write_u32(&mut packet, packet_len as u32);
     packet.push(padding_len as u8);
     packet.extend_from_slice(payload);
-    
+
     // Add random padding
     let mut rng = SimpleRng::new();
     let pad_start = packet.len();
     packet.resize(pad_start + padding_len, 0);
     rng.fill_bytes(&mut packet[pad_start..]);
-    
+
     // Compute MAC before encryption: MAC(key, seq || unencrypted_packet)
     let mut mac = <HmacSha256 as Mac>::new_from_slice(mac_key).unwrap();
     mac.update(&seq.to_be_bytes());
     mac.update(&packet);
     let mac_result = mac.finalize().into_bytes();
-    
+
     // Encrypt the packet
     cipher.apply_keystream(&mut packet);
-    
+
     // Append MAC
     packet.extend_from_slice(&mac_result);
-    
+
     packet
 }
 
@@ -195,7 +203,7 @@ pub fn build_encrypted_packet(
 /// K1 = HASH(K || H || letter || session_id)
 pub fn derive_key(k: &[u8], h: &[u8], letter: u8, session_id: &[u8], size: usize) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    
+
     // K is encoded as mpint (with leading zero if high bit set)
     let mut k_mpint = Vec::new();
     if !k.is_empty() && k[0] & 0x80 != 0 {
@@ -205,14 +213,14 @@ pub fn derive_key(k: &[u8], h: &[u8], letter: u8, session_id: &[u8], size: usize
         write_u32(&mut k_mpint, k.len() as u32);
     }
     k_mpint.extend_from_slice(k);
-    
+
     hasher.update(&k_mpint);
     hasher.update(h);
     hasher.update(&[letter]);
     hasher.update(session_id);
-    
+
     let mut result: Vec<u8> = hasher.finalize().to_vec();
-    
+
     // If we need more bytes, continue hashing
     while result.len() < size {
         let mut hasher = Sha256::new();
@@ -221,7 +229,7 @@ pub fn derive_key(k: &[u8], h: &[u8], letter: u8, session_id: &[u8], size: usize
         hasher.update(&result);
         result.extend_from_slice(&hasher.finalize());
     }
-    
+
     result.truncate(size);
     result
 }
@@ -232,8 +240,15 @@ pub fn derive_key(k: &[u8], h: &[u8], letter: u8, session_id: &[u8], size: usize
 
 /// Trim leading and trailing ASCII whitespace from bytes
 pub fn trim_bytes(data: &[u8]) -> &[u8] {
-    let start = data.iter().position(|&b| !b.is_ascii_whitespace()).unwrap_or(data.len());
-    let end = data.iter().rposition(|&b| !b.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(start);
+    let start = data
+        .iter()
+        .position(|&b| !b.is_ascii_whitespace())
+        .unwrap_or(data.len());
+    let end = data
+        .iter()
+        .rposition(|&b| !b.is_ascii_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(start);
     &data[start..end]
 }
 
@@ -245,4 +260,3 @@ pub fn split_first_word(data: &[u8]) -> (&[u8], &[u8]) {
         (data, &[])
     }
 }
-

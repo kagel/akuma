@@ -550,15 +550,13 @@ pub fn poll_ssh() -> SshEvent {
         return SshEvent::Connected;
     }
 
-    // Check for disconnect
-    if (socket.state() == TcpState::Listen || socket.state() == TcpState::Closed)
-        && stack.ssh_was_connected
-    {
+    // Check for disconnect - handle all non-established states when we were connected
+    let state = socket.state();
+    if stack.ssh_was_connected && state != TcpState::Established {
         stack.ssh_was_connected = false;
-        // Re-listen if socket closed
-        if socket.state() == TcpState::Closed {
-            let _ = socket.listen(SSH_PORT);
-        }
+        // Abort and re-listen to ensure socket is ready for new connections
+        socket.abort();
+        let _ = socket.listen(SSH_PORT);
         return SshEvent::Disconnected;
     }
 
@@ -572,11 +570,6 @@ pub fn poll_ssh() -> SshEvent {
             }
             _ => {}
         }
-    }
-
-    // Re-listen if socket closed
-    if socket.state() == TcpState::Closed {
-        let _ = socket.listen(SSH_PORT);
     }
 
     SshEvent::None
@@ -603,7 +596,7 @@ pub fn ssh_send(data: &[u8]) -> bool {
     false
 }
 
-/// Close the SSH connection
+/// Close the SSH connection and prepare for new connections
 pub fn ssh_close() {
     let mut stack_guard = NET_STACK.lock();
     let stack = match stack_guard.as_mut() {
@@ -612,7 +605,14 @@ pub fn ssh_close() {
     };
 
     let socket = stack.sockets.get_mut::<TcpSocket>(stack.ssh_handle);
-    socket.close();
+
+    // Abort the connection to immediately reset the socket state
+    // This avoids getting stuck in TIME_WAIT or other intermediate states
+    socket.abort();
+    stack.ssh_was_connected = false;
+
+    // Re-listen immediately
+    let _ = socket.listen(SSH_PORT);
 }
 
 /// Get network statistics: (connections, bytes_rx, bytes_tx)

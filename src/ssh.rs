@@ -9,24 +9,23 @@
 //! - Accepts any authentication
 //! - Shell with basic commands
 
-use alloc::vec::Vec;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::convert::TryInto;
 use spinning_top::Spinlock;
 
-use ed25519_dalek::{SigningKey, Signer, SECRET_KEY_LENGTH};
-use x25519_dalek::PublicKey as X25519PublicKey;
+use ed25519_dalek::{Signer, SigningKey, SECRET_KEY_LENGTH};
 use hmac::Mac;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
+use x25519_dalek::PublicKey as X25519PublicKey;
 
 use crate::akuma::AKUMA_79;
 use crate::console;
 use crate::network::{self, SshEvent};
 use crate::ssh_crypto::{
-    SimpleRng, CryptoState, Aes128Ctr, HmacSha256,
-    AES_KEY_SIZE, AES_IV_SIZE, MAC_KEY_SIZE, MAC_SIZE,
-    write_u32, write_string, write_namelist, read_u32, read_string,
-    build_packet, build_encrypted_packet, derive_key, trim_bytes, split_first_word,
+    build_encrypted_packet, build_packet, derive_key, read_string, read_u32, split_first_word,
+    trim_bytes, write_namelist, write_string, write_u32, Aes128Ctr, CryptoState, HmacSha256,
+    SimpleRng, AES_IV_SIZE, AES_KEY_SIZE, MAC_KEY_SIZE, MAC_SIZE,
 };
 
 // ============================================================================
@@ -108,7 +107,7 @@ impl SshSession {
             state: SshState::Disconnected,
             rng: SimpleRng::new(),
             client_version: Vec::new(),
-            server_version: SSH_VERSION[..SSH_VERSION.len()-2].to_vec(),
+            server_version: SSH_VERSION[..SSH_VERSION.len() - 2].to_vec(),
             client_kexinit: Vec::new(),
             server_kexinit: Vec::new(),
             session_id: [0u8; 32],
@@ -149,11 +148,11 @@ static SESSION: Spinlock<Option<SshSession>> = Spinlock::new(None);
 fn build_kexinit(rng: &mut SimpleRng) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_MSG_KEXINIT);
-    
+
     let mut cookie = [0u8; 16];
     rng.fill_bytes(&mut cookie);
     payload.extend_from_slice(&cookie);
-    
+
     write_namelist(&mut payload, &[KEX_ALGO]);
     write_namelist(&mut payload, &[HOST_KEY_ALGO]);
     write_namelist(&mut payload, &[CIPHER_ALGO]);
@@ -166,7 +165,7 @@ fn build_kexinit(rng: &mut SimpleRng) -> Vec<u8> {
     write_namelist(&mut payload, &[]);
     payload.push(0);
     write_u32(&mut payload, 0);
-    
+
     payload
 }
 
@@ -178,26 +177,26 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
     // Generate server ephemeral key pair using X25519
     let mut secret_bytes = [0u8; 32];
     session.rng.fill_bytes(&mut secret_bytes);
-    
+
     let server_secret = x25519_dalek::StaticSecret::from(secret_bytes);
     let server_public = X25519PublicKey::from(&server_secret);
     let server_pubkey = server_public.as_bytes();
-    
+
     // Parse client's X25519 public key
     let client_pubkey_bytes: [u8; 32] = client_pubkey.try_into().ok()?;
     let client_public = X25519PublicKey::from(client_pubkey_bytes);
-    
+
     // Compute shared secret via ECDH
     let shared_secret_point = server_secret.diffie_hellman(&client_public);
     let shared_secret = shared_secret_point.as_bytes().to_vec();
-    
+
     let host_key = session.host_key.as_ref()?;
     let host_pubkey = host_key.verifying_key().to_bytes();
-    
+
     let mut host_key_blob = Vec::new();
     write_string(&mut host_key_blob, b"ssh-ed25519");
     write_string(&mut host_key_blob, &host_pubkey);
-    
+
     let mut hash_data = Vec::new();
     write_string(&mut hash_data, &session.client_version);
     write_string(&mut hash_data, &session.server_version);
@@ -206,7 +205,7 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
     write_string(&mut hash_data, &host_key_blob);
     write_string(&mut hash_data, client_pubkey);
     write_string(&mut hash_data, server_pubkey);
-    
+
     // K as mpint
     if !shared_secret.is_empty() && shared_secret[0] & 0x80 != 0 {
         write_u32(&mut hash_data, (shared_secret.len() + 1) as u32);
@@ -215,48 +214,90 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
         write_u32(&mut hash_data, shared_secret.len() as u32);
     }
     hash_data.extend_from_slice(&shared_secret);
-    
+
     let mut hasher = Sha256::new();
     hasher.update(&hash_data);
     let exchange_hash: [u8; 32] = hasher.finalize().into();
-    
+
     if session.session_id == [0u8; 32] {
         session.session_id = exchange_hash;
     }
-    
+
     let signature = host_key.sign(&exchange_hash);
     let mut sig_blob = Vec::new();
     write_string(&mut sig_blob, b"ssh-ed25519");
     write_string(&mut sig_blob, signature.to_bytes().as_slice());
-    
+
     // Derive encryption keys
-    let iv_c2s = derive_key(&shared_secret, &exchange_hash, b'A', &session.session_id, AES_IV_SIZE);
-    let iv_s2c = derive_key(&shared_secret, &exchange_hash, b'B', &session.session_id, AES_IV_SIZE);
-    let key_c2s = derive_key(&shared_secret, &exchange_hash, b'C', &session.session_id, AES_KEY_SIZE);
-    let key_s2c = derive_key(&shared_secret, &exchange_hash, b'D', &session.session_id, AES_KEY_SIZE);
-    let mac_c2s = derive_key(&shared_secret, &exchange_hash, b'E', &session.session_id, MAC_KEY_SIZE);
-    let mac_s2c = derive_key(&shared_secret, &exchange_hash, b'F', &session.session_id, MAC_KEY_SIZE);
-    
+    let iv_c2s = derive_key(
+        &shared_secret,
+        &exchange_hash,
+        b'A',
+        &session.session_id,
+        AES_IV_SIZE,
+    );
+    let iv_s2c = derive_key(
+        &shared_secret,
+        &exchange_hash,
+        b'B',
+        &session.session_id,
+        AES_IV_SIZE,
+    );
+    let key_c2s = derive_key(
+        &shared_secret,
+        &exchange_hash,
+        b'C',
+        &session.session_id,
+        AES_KEY_SIZE,
+    );
+    let key_s2c = derive_key(
+        &shared_secret,
+        &exchange_hash,
+        b'D',
+        &session.session_id,
+        AES_KEY_SIZE,
+    );
+    let mac_c2s = derive_key(
+        &shared_secret,
+        &exchange_hash,
+        b'E',
+        &session.session_id,
+        MAC_KEY_SIZE,
+    );
+    let mac_s2c = derive_key(
+        &shared_secret,
+        &exchange_hash,
+        b'F',
+        &session.session_id,
+        MAC_KEY_SIZE,
+    );
+
     use ctr::cipher::KeyIvInit;
     session.crypto.decrypt_cipher = Some(Aes128Ctr::new(
         key_c2s[..AES_KEY_SIZE].try_into().unwrap(),
-        iv_c2s[..AES_IV_SIZE].try_into().unwrap()
+        iv_c2s[..AES_IV_SIZE].try_into().unwrap(),
     ));
-    session.crypto.decrypt_mac_key.copy_from_slice(&mac_c2s[..MAC_KEY_SIZE]);
-    
+    session
+        .crypto
+        .decrypt_mac_key
+        .copy_from_slice(&mac_c2s[..MAC_KEY_SIZE]);
+
     session.crypto.encrypt_cipher = Some(Aes128Ctr::new(
         key_s2c[..AES_KEY_SIZE].try_into().unwrap(),
-        iv_s2c[..AES_IV_SIZE].try_into().unwrap()
+        iv_s2c[..AES_IV_SIZE].try_into().unwrap(),
     ));
-    session.crypto.encrypt_mac_key.copy_from_slice(&mac_s2c[..MAC_KEY_SIZE]);
-    
+    session
+        .crypto
+        .encrypt_mac_key
+        .copy_from_slice(&mac_s2c[..MAC_KEY_SIZE]);
+
     // Build KEX_ECDH_REPLY
     let mut reply = Vec::new();
     reply.push(SSH_MSG_KEX_ECDH_REPLY);
     write_string(&mut reply, &host_key_blob);
     write_string(&mut reply, server_pubkey);
     write_string(&mut reply, &sig_blob);
-    
+
     Some(reply)
 }
 
@@ -310,10 +351,10 @@ fn execute_command(line: &[u8]) -> Vec<u8> {
     if line.is_empty() {
         return Vec::new();
     }
-    
+
     let (cmd, args) = split_first_word(line);
     let mut response = Vec::new();
-    
+
     match cmd {
         b"echo" => {
             if !args.is_empty() {
@@ -332,7 +373,8 @@ fn execute_command(line: &[u8]) -> Vec<u8> {
         }
         b"stats" => {
             let (connections, bytes_rx, bytes_tx) = network::get_stats();
-            let stats = alloc::format!(
+            let stats =
+                alloc::format!(
                 "Network Statistics:\r\n  Connections: {}\r\n  Bytes RX: {}\r\n  Bytes TX: {}\r\n",
                 connections, bytes_rx, bytes_tx
             );
@@ -352,7 +394,7 @@ fn execute_command(line: &[u8]) -> Vec<u8> {
             response.extend_from_slice(b"\r\nType 'help' for available commands.\r\n");
         }
     }
-    
+
     response
 }
 
@@ -368,24 +410,26 @@ fn handle_shell_input(session: &mut SshSession, data: &[u8]) {
             b'\r' | b'\n' => {
                 let line = session.line_buffer.clone();
                 session.line_buffer.clear();
-                
+
                 send_channel_data(session, b"\r\n");
-                
+
                 if !line.is_empty() {
                     let response = execute_command(&line);
                     if !response.is_empty() {
                         send_channel_data(session, &response);
                     }
-                    
+
                     if is_quit_command(&line) {
                         let mut close = vec![SSH_MSG_CHANNEL_CLOSE];
                         write_u32(&mut close, session.client_channel);
                         send_packet(&close, session);
                         session.channel_open = false;
+                        session.state = SshState::Disconnected;
+                        network::ssh_close();
                         return;
                     }
                 }
-                
+
                 send_channel_data(session, b"akuma> ");
             }
             0x7F | 0x08 => {
@@ -406,6 +450,8 @@ fn handle_shell_input(session: &mut SshSession, data: &[u8]) {
                     write_u32(&mut close, session.client_channel);
                     send_packet(&close, session);
                     session.channel_open = false;
+                    session.state = SshState::Disconnected;
+                    network::ssh_close();
                 }
             }
             _ if byte >= 0x20 && byte < 0x7F => {
@@ -422,27 +468,30 @@ fn handle_shell_input(session: &mut SshSession, data: &[u8]) {
 // ============================================================================
 
 fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
-    log(&alloc::format!("[SSH] Received message type {}\n", msg_type));
-    
+    log(&alloc::format!(
+        "[SSH] Received message type {}\n",
+        msg_type
+    ));
+
     match msg_type {
         SSH_MSG_KEXINIT => {
             let mut full = vec![SSH_MSG_KEXINIT];
             full.extend_from_slice(payload);
             session.client_kexinit = full;
-            
+
             let kexinit = build_kexinit(&mut session.rng);
             session.server_kexinit = kexinit.clone();
-            
+
             send_unencrypted_packet(&kexinit, session);
             session.state = SshState::AwaitingKexEcdhInit;
         }
-        
+
         SSH_MSG_KEX_ECDH_INIT => {
             let mut offset = 0;
             if let Some(client_pubkey) = read_string(payload, &mut offset) {
                 if let Some(reply) = handle_kex_ecdh_init(session, client_pubkey) {
                     send_unencrypted_packet(&reply, session);
-                    
+
                     let newkeys = vec![SSH_MSG_NEWKEYS];
                     send_unencrypted_packet(&newkeys, session);
                     session.state = SshState::AwaitingNewKeys;
@@ -451,71 +500,87 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
                 }
             }
         }
-        
+
         SSH_MSG_NEWKEYS => {
             log("[SSH] Encryption activated\n");
             session.state = SshState::AwaitingServiceRequest;
         }
-        
+
         SSH_MSG_SERVICE_REQUEST => {
             let mut offset = 0;
             if let Some(service) = read_string(payload, &mut offset) {
-                log(&alloc::format!("[SSH] Service request: {:?}\n", core::str::from_utf8(service)));
-                
+                log(&alloc::format!(
+                    "[SSH] Service request: {:?}\n",
+                    core::str::from_utf8(service)
+                ));
+
                 let mut reply = vec![SSH_MSG_SERVICE_ACCEPT];
                 write_string(&mut reply, service);
                 send_packet(&reply, session);
                 session.state = SshState::AwaitingUserAuth;
             }
         }
-        
+
         SSH_MSG_USERAUTH_REQUEST => {
             let reply = vec![SSH_MSG_USERAUTH_SUCCESS];
             send_packet(&reply, session);
             session.state = SshState::Authenticated;
             log("[SSH] User authenticated\n");
         }
-        
+
         SSH_MSG_CHANNEL_OPEN => {
             let mut offset = 0;
             let channel_type = read_string(payload, &mut offset);
             let sender_channel = read_u32(payload, &mut offset);
             let initial_window = read_u32(payload, &mut offset);
             let max_packet = read_u32(payload, &mut offset);
-            
-            if let (Some(_), Some(sender), Some(_), Some(_)) = (channel_type, sender_channel, initial_window, max_packet) {
+
+            if let (Some(_), Some(sender), Some(_), Some(_)) =
+                (channel_type, sender_channel, initial_window, max_packet)
+            {
                 session.client_channel = sender;
                 session.channel_open = true;
-                
+
                 let mut reply = vec![SSH_MSG_CHANNEL_OPEN_CONFIRMATION];
                 write_u32(&mut reply, sender);
                 write_u32(&mut reply, 0);
                 write_u32(&mut reply, 0x100000);
                 write_u32(&mut reply, 0x4000);
                 send_packet(&reply, session);
-                
+
                 log("[SSH] Channel opened\n");
             }
         }
-        
+
         SSH_MSG_CHANNEL_REQUEST => {
             let mut offset = 0;
             let _recipient = read_u32(payload, &mut offset);
             let request_type = read_string(payload, &mut offset);
-            let want_reply = if offset < payload.len() { payload[offset] != 0 } else { false };
-            
+            let want_reply = if offset < payload.len() {
+                payload[offset] != 0
+            } else {
+                false
+            };
+
             if let Some(req_type) = request_type {
-                log(&alloc::format!("[SSH] Channel request: {:?}\n", core::str::from_utf8(req_type)));
-                
+                log(&alloc::format!(
+                    "[SSH] Channel request: {:?}\n",
+                    core::str::from_utf8(req_type)
+                ));
+
                 let success = matches!(req_type, b"pty-req" | b"shell" | b"env");
-                
+
                 if want_reply {
-                    let msg_type = if success { SSH_MSG_CHANNEL_SUCCESS } else { SSH_MSG_CHANNEL_FAILURE };
+                    let msg_type = if success {
+                        SSH_MSG_CHANNEL_SUCCESS
+                    } else {
+                        SSH_MSG_CHANNEL_FAILURE
+                    };
                     let mut full_reply = vec![msg_type];
                     write_u32(&mut full_reply, session.client_channel);
                     send_packet(&full_reply, session);
                 }
-                
+
                 if req_type == b"shell" {
                     send_channel_data(session, b"\r\n=================================\r\n");
                     send_channel_data(session, b"  Welcome to Akuma SSH Server\r\n");
@@ -525,7 +590,7 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
                 }
             }
         }
-        
+
         SSH_MSG_CHANNEL_DATA => {
             let mut offset = 0;
             let _recipient = read_u32(payload, &mut offset);
@@ -533,7 +598,7 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
                 handle_shell_input(session, data);
             }
         }
-        
+
         SSH_MSG_CHANNEL_EOF | SSH_MSG_CHANNEL_CLOSE => {
             log("[SSH] Channel close requested\n");
             let mut reply = vec![SSH_MSG_CHANNEL_CLOSE];
@@ -541,21 +606,24 @@ fn handle_message(msg_type: u8, payload: &[u8], session: &mut SshSession) {
             send_packet(&reply, session);
             session.channel_open = false;
         }
-        
+
         SSH_MSG_GLOBAL_REQUEST => {
             let reply = vec![SSH_MSG_REQUEST_FAILURE];
             send_packet(&reply, session);
         }
-        
+
         SSH_MSG_DISCONNECT => {
             log("[SSH] Client disconnected\n");
             session.state = SshState::Disconnected;
         }
-        
+
         SSH_MSG_IGNORE | SSH_MSG_DEBUG => {}
-        
+
         _ => {
-            log(&alloc::format!("[SSH] Unhandled message type {}\n", msg_type));
+            log(&alloc::format!(
+                "[SSH] Unhandled message type {}\n",
+                msg_type
+            ));
             let mut reply = vec![SSH_MSG_UNIMPLEMENTED];
             write_u32(&mut reply, session.crypto.decrypt_seq.wrapping_sub(1));
             send_packet(&reply, session);
@@ -572,61 +640,65 @@ fn process_encrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)> {
     if session.input_buffer.len() < 4 {
         return None;
     }
-    
+
     let cipher = session.crypto.decrypt_cipher.as_mut()?;
-    
+
     // Clone cipher to peek at packet length without advancing the real cipher
     use ctr::cipher::StreamCipher;
     let mut peek_cipher = cipher.clone();
-    
+
     // Decrypt first 4 bytes to get packet length
     let mut len_buf = [0u8; 4];
     len_buf.copy_from_slice(&session.input_buffer[..4]);
     peek_cipher.apply_keystream(&mut len_buf);
     let packet_len = u32::from_be_bytes(len_buf) as usize;
-    
+
     // Total size needed: 4 (length) + packet_len + MAC_SIZE
     let total_needed = 4 + packet_len + MAC_SIZE;
     if session.input_buffer.len() < total_needed {
         return None;
     }
-    
+
     // We have enough data - now decrypt for real
     let encrypted_data = &session.input_buffer[..4 + packet_len];
     let received_mac = &session.input_buffer[4 + packet_len..total_needed];
-    
+
     // Decrypt the packet
     let mut decrypted = encrypted_data.to_vec();
     cipher.apply_keystream(&mut decrypted);
-    
+
     // Verify MAC: MAC(key, sequence_number || unencrypted_packet)
     let seq = session.crypto.decrypt_seq;
     let mut mac = <HmacSha256 as Mac>::new_from_slice(&session.crypto.decrypt_mac_key).ok()?;
     mac.update(&seq.to_be_bytes());
     mac.update(&decrypted);
-    
+
     if mac.verify_slice(received_mac).is_err() {
-        log(&alloc::format!("[SSH] MAC verification failed (seq={}, pkt_len={}, buf_len={})\n", 
-            seq, packet_len, session.input_buffer.len()));
+        log(&alloc::format!(
+            "[SSH] MAC verification failed (seq={}, pkt_len={}, buf_len={})\n",
+            seq,
+            packet_len,
+            session.input_buffer.len()
+        ));
         return None;
     }
-    
+
     session.crypto.decrypt_seq = seq.wrapping_add(1);
-    
+
     // Parse packet
     let padding_len = decrypted[4] as usize;
     let payload_len = packet_len - padding_len - 1;
-    
+
     if 5 + payload_len > decrypted.len() {
         return None;
     }
-    
+
     let msg_type = decrypted[5];
     let payload = decrypted[6..5 + payload_len].to_vec();
-    
+
     // Remove processed packet from buffer
     session.input_buffer = session.input_buffer[total_needed..].to_vec();
-    
+
     Some((msg_type, payload))
 }
 
@@ -634,23 +706,23 @@ fn process_unencrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)>
     if session.input_buffer.len() < 5 {
         return None;
     }
-    
+
     let packet_len = u32::from_be_bytes(session.input_buffer[..4].try_into().ok()?) as usize;
     let total_len = 4 + packet_len;
-    
+
     if session.input_buffer.len() < total_len {
         return None;
     }
-    
+
     let padding_len = session.input_buffer[4] as usize;
     let payload_len = packet_len - padding_len - 1;
-    
+
     let msg_type = session.input_buffer[5];
-    let payload = session.input_buffer[6..5+payload_len].to_vec();
-    
+    let payload = session.input_buffer[6..5 + payload_len].to_vec();
+
     session.crypto.decrypt_seq = session.crypto.decrypt_seq.wrapping_add(1);
     session.input_buffer = session.input_buffer[total_len..].to_vec();
-    
+
     Some((msg_type, payload))
 }
 
@@ -663,10 +735,10 @@ fn handle_connect() {
     let session = guard.insert(SshSession::new());
     session.state = SshState::AwaitingVersion;
     session.generate_host_key();
-    
+
     log("[SSH] Client connected\n");
     drop(guard);
-    
+
     send_raw(SSH_VERSION);
 }
 
@@ -676,41 +748,43 @@ fn handle_data(data: &[u8]) {
         Some(s) => s,
         None => return,
     };
-    
+
     if session.state == SshState::Disconnected {
         return;
     }
-    
+
     session.input_buffer.extend_from_slice(data);
-    
+
     if session.state == SshState::AwaitingVersion {
         if let Some(pos) = session.input_buffer.iter().position(|&b| b == b'\n') {
             let version_line = session.input_buffer[..pos].to_vec();
-            session.input_buffer = session.input_buffer[pos+1..].to_vec();
-            
+            session.input_buffer = session.input_buffer[pos + 1..].to_vec();
+
             let version = if version_line.ends_with(b"\r") {
-                version_line[..version_line.len()-1].to_vec()
+                version_line[..version_line.len() - 1].to_vec()
             } else {
                 version_line
             };
-            
+
             session.client_version = version;
             session.state = SshState::AwaitingKexInit;
             log("[SSH] Client version received\n");
         }
         return;
     }
-    
+
     loop {
-        let use_encryption = !matches!(session.state, 
-            SshState::AwaitingNewKeys | SshState::AwaitingKexInit | SshState::AwaitingKexEcdhInit);
-        
+        let use_encryption = !matches!(
+            session.state,
+            SshState::AwaitingNewKeys | SshState::AwaitingKexInit | SshState::AwaitingKexEcdhInit
+        );
+
         let packet = if use_encryption {
             process_encrypted_packet(session)
         } else {
             process_unencrypted_packet(session)
         };
-        
+
         match packet {
             Some((msg_type, payload)) => {
                 handle_message(msg_type, &payload, session);
@@ -745,7 +819,7 @@ fn log(msg: &str) {
 pub fn ssh_server_entry() -> ! {
     log("[SSH] SSH server thread started\n");
     log("[SSH] Connect with: ssh -o StrictHostKeyChecking=no user@localhost -p 2222\n");
-    
+
     loop {
         match network::poll_ssh() {
             SshEvent::Connected => handle_connect(),
@@ -753,7 +827,7 @@ pub fn ssh_server_entry() -> ! {
             SshEvent::Disconnected => handle_disconnect(),
             SshEvent::None => {}
         }
-        
+
         crate::threading::yield_now();
     }
 }
