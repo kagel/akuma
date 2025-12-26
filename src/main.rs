@@ -122,10 +122,18 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
     console::print("Threading system initialized\n");
 
     // =========================================================================
-    // Network initialization SKIPPED - virtio driver hangs
-    // TODO: Fix virtio driver initialization
+    // Network initialization
     // =========================================================================
-    console::print("\n--- Network Initialization SKIPPED (virtio hangs) ---\n\n");
+    console::print("\n--- Network Initialization ---\n");
+    match network::init(0) {
+        Ok(()) => console::print("[Net] Network initialized successfully\n"),
+        Err(e) => {
+            console::print("[Net] Network init failed: ");
+            console::print(e);
+            console::print("\n");
+        }
+    }
+    console::print("--- Network Initialization Done ---\n\n");
 
     // =========================================================================
     // Now enable preemptive scheduling (timer interrupts)

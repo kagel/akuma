@@ -178,14 +178,14 @@ fn test_realloc_grow() -> bool {
     let mut vec: Vec<u64> = Vec::with_capacity(4);
     console::print(&format!("  Initial capacity: {}\n", vec.capacity()));
 
-    // Fill with known pattern
+    // Fill with known pattern (use wrapping_mul to avoid overflow panic)
     for i in 0..4u64 {
-        vec.push(i * 0x1111_1111_1111_1111);
+        vec.push(i.wrapping_mul(0x1111_1111_1111_1111));
     }
 
     // Force reallocation by pushing more
     for i in 4..20u64 {
-        vec.push(i * 0x1111_1111_1111_1111);
+        vec.push(i.wrapping_mul(0x1111_1111_1111_1111));
     }
     console::print(&format!(
         "  New capacity: {} (should be >= 20)\n",
@@ -195,7 +195,7 @@ fn test_realloc_grow() -> bool {
     // Verify all data preserved
     let mut data_ok = true;
     for i in 0..20u64 {
-        if vec[i as usize] != i * 0x1111_1111_1111_1111 {
+        if vec[i as usize] != i.wrapping_mul(0x1111_1111_1111_1111) {
             console::print(&format!("  Data mismatch at index {}\n", i));
             data_ok = false;
             break;
