@@ -1,194 +1,77 @@
-// Network stack with device registry
-// Uses fixed-size arrays - no heap allocation during init
+// Network stack with TCP netcat-like server
+// Uses smoltcp for TCP/IP and virtio-net for the network device
 
-use smoltcp::iface::{Config, Interface};
+use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use spinning_top::Spinlock;
 use virtio_drivers::device::net::VirtIONetRaw;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
+use crate::console;
+use crate::timer;
 use crate::virtio_hal::VirtioHal;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const MAX_INTERFACES: usize = 4;
-const MAX_NAME_LEN: usize = 8;
+const LISTEN_PORT: u16 = 23; // Telnet port, forwarded from host 2323
 
 // ============================================================================
-// Network Interface Types
+// Static Buffers (required for smoltcp and virtio)
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum InterfaceType {
-    None = 0,
-    Loopback = 1,
-    Ethernet = 2,
-}
+// Virtio DMA buffers
+static mut VIRTIO_RX_BUFFER: [u8; 2048] = [0; 2048];
+static mut VIRTIO_TX_BUFFER: [u8; 2048] = [0; 2048];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum InterfaceStatus {
-    Down = 0,
-    Up = 1,
-}
+// smoltcp socket buffers
+static mut TCP_RX_DATA: [u8; 4096] = [0; 4096];
+static mut TCP_TX_DATA: [u8; 4096] = [0; 4096];
+
+// smoltcp socket storage
+static mut SOCKET_STORAGE: [SocketStorage<'static>; 2] = [SocketStorage::EMPTY; 2];
 
 // ============================================================================
-// Network Interface
+// Global State
 // ============================================================================
 
-#[derive(Clone, Copy)]
-pub struct NetworkInterface {
-    pub name: [u8; MAX_NAME_LEN],
-    pub iface_type: InterfaceType,
-    pub status: InterfaceStatus,
-    pub mac: [u8; 6],
+struct NetStack {
+    device: VirtioNetDevice,
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    tcp_handle: smoltcp::iface::SocketHandle,
+    rx_pending: bool,
+    rx_token: u16,
 }
 
-impl NetworkInterface {
-    pub const fn empty() -> Self {
-        Self {
-            name: [0; MAX_NAME_LEN],
-            iface_type: InterfaceType::None,
-            status: InterfaceStatus::Down,
-            mac: [0; 6],
-        }
-    }
-
-    pub fn name_str(&self) -> &str {
-        let len = self
-            .name
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(MAX_NAME_LEN);
-        core::str::from_utf8(&self.name[..len]).unwrap_or("???")
-    }
-}
+static NET_STACK: Spinlock<Option<NetStack>> = Spinlock::new(None);
+static NET_INITIALIZED: Spinlock<bool> = Spinlock::new(false);
 
 // ============================================================================
-// Network State (fixed-size, no allocation)
+// Virtio Network Device
 // ============================================================================
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum NetworkStatus {
-    Uninitialized = 0,
-    Initializing = 1,
-    Ready = 2,
-    Error = 3,
-}
-
-pub struct NetworkState {
-    pub status: NetworkStatus,
-    pub interfaces: [NetworkInterface; MAX_INTERFACES],
-    pub interface_count: usize,
-    pub has_ethernet: bool,
-}
-
-impl NetworkState {
-    pub const fn new() -> Self {
-        Self {
-            status: NetworkStatus::Uninitialized,
-            interfaces: [NetworkInterface::empty(); MAX_INTERFACES],
-            interface_count: 0,
-            has_ethernet: false,
-        }
-    }
-
-    pub fn is_ready(&self) -> bool {
-        self.status == NetworkStatus::Ready
-    }
-
-    pub fn add_interface(&mut self, name: &[u8], iface_type: InterfaceType, mac: [u8; 6]) -> bool {
-        if self.interface_count >= MAX_INTERFACES {
-            return false;
-        }
-
-        let idx = self.interface_count;
-        self.interface_count += 1;
-
-        // Copy name
-        for (i, &c) in name.iter().enumerate() {
-            if i < MAX_NAME_LEN {
-                self.interfaces[idx].name[i] = c;
-            }
-        }
-
-        self.interfaces[idx].iface_type = iface_type;
-        self.interfaces[idx].status = InterfaceStatus::Up;
-        self.interfaces[idx].mac = mac;
-
-        if iface_type == InterfaceType::Ethernet {
-            self.has_ethernet = true;
-        }
-
-        true
-    }
-
-    pub fn get_interface(&self, name: &str) -> Option<&NetworkInterface> {
-        for i in 0..self.interface_count {
-            if self.interfaces[i].name_str() == name {
-                return Some(&self.interfaces[i]);
-            }
-        }
-        None
-    }
-}
-
-// ============================================================================
-// Global Network State
-// ============================================================================
-
-static mut NETWORK_STATE: NetworkState = NetworkState::new();
-
-/// Check if network is initialized and ready
-pub fn is_ready() -> bool {
-    unsafe {
-        let ptr = core::ptr::addr_of!(NETWORK_STATE);
-        (*ptr).is_ready()
-    }
-}
-
-/// Get network status
-pub fn status() -> NetworkStatus {
-    unsafe {
-        let ptr = core::ptr::addr_of!(NETWORK_STATE);
-        (*ptr).status
-    }
-}
-
-/// Get interface count
-pub fn interface_count() -> usize {
-    unsafe {
-        let ptr = core::ptr::addr_of!(NETWORK_STATE);
-        (*ptr).interface_count
-    }
-}
-
-/// Check if ethernet is available
-pub fn has_ethernet() -> bool {
-    unsafe {
-        let ptr = core::ptr::addr_of!(NETWORK_STATE);
-        (*ptr).has_ethernet
-    }
-}
-
-// ============================================================================
-// Virtio-net Device
-// ============================================================================
-
-static mut VIRTIO_RX_BUFFER: [u8; 4096] = [0; 4096];
-static mut VIRTIO_TX_BUFFER: [u8; 4096] = [0; 4096];
 
 pub struct VirtioNetDevice {
     inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>,
 }
 
+impl VirtioNetDevice {
+    fn new(inner: VirtIONetRaw<VirtioHal, MmioTransport, 16>) -> Self {
+        Self { inner }
+    }
+}
+
+// ============================================================================
+// smoltcp Device Implementation
+// ============================================================================
+
 pub struct VirtioRxToken {
-    len: usize,
+    offset: usize,  // Start of actual Ethernet data (after virtio header)
+    len: usize,     // Length of Ethernet frame (not including virtio header)
 }
 
 pub struct VirtioTxToken<'a> {
@@ -200,7 +83,10 @@ impl RxToken for VirtioRxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        unsafe { f(&mut VIRTIO_RX_BUFFER[..self.len]) }
+        unsafe {
+            // Pass only the Ethernet frame (skip virtio header)
+            f(&mut VIRTIO_RX_BUFFER[self.offset..self.offset + self.len])
+        }
     }
 }
 
@@ -217,16 +103,60 @@ impl<'a> TxToken for VirtioTxToken<'a> {
     }
 }
 
-impl Device for VirtioNetDevice {
-    type RxToken<'a> = VirtioRxToken;
-    type TxToken<'a> = VirtioTxToken<'a>;
+// Pending receive state
+static mut RX_PENDING_TOKEN: Option<u16> = None;
 
-    fn receive(&mut self, _ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        None
+impl Device for VirtioNetDevice {
+    type RxToken<'a> = VirtioRxToken where Self: 'a;
+    type TxToken<'a> = VirtioTxToken<'a> where Self: 'a;
+
+    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        unsafe {
+            let buf = &mut VIRTIO_RX_BUFFER[..];
+            
+            // Check if we have a pending receive
+            if let Some(token) = RX_PENDING_TOKEN {
+                // Check if it's ready
+                if self.inner.poll_receive().is_some() {
+                    RX_PENDING_TOKEN = None;
+                    match self.inner.receive_complete(token, buf) {
+                        Ok((hdr_len, data_len)) => {
+                            return Some((
+                                VirtioRxToken { offset: hdr_len, len: data_len },
+                                VirtioTxToken { device: self },
+                            ));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            } else {
+                // Start a new receive
+                match self.inner.receive_begin(buf) {
+                    Ok(token) => {
+                        RX_PENDING_TOKEN = Some(token);
+                        // Check if immediately ready
+                        if self.inner.poll_receive().is_some() {
+                            RX_PENDING_TOKEN = None;
+                            match self.inner.receive_complete(token, buf) {
+                                Ok((hdr_len, data_len)) => {
+                                    return Some((
+                                        VirtioRxToken { offset: hdr_len, len: data_len },
+                                        VirtioTxToken { device: self },
+                                    ));
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            None
+        }
     }
 
-    fn transmit(&mut self, _ts: Instant) -> Option<Self::TxToken<'_>> {
-        None
+    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        Some(VirtioTxToken { device: self })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -238,22 +168,11 @@ impl Device for VirtioNetDevice {
 }
 
 // ============================================================================
-// Logging Helpers
+// Logging Helper
 // ============================================================================
 
-#[inline(always)]
-fn log(msg: &[u8]) {
-    unsafe {
-        const UART: *mut u8 = 0x0900_0000 as *mut u8;
-        for &c in msg {
-            core::ptr::write_volatile(UART, c);
-        }
-    }
-}
-
-fn log_hex_byte(b: u8) {
-    let hex = |n: u8| if n < 10 { b'0' + n } else { b'a' + n - 10 };
-    log(&[hex((b >> 4) & 0xF), hex(b & 0xF)]);
+fn log(msg: &str) {
+    console::print(msg);
 }
 
 // ============================================================================
@@ -262,42 +181,27 @@ fn log_hex_byte(b: u8) {
 
 /// QEMU virt machine virtio MMIO addresses
 const VIRTIO_MMIO_ADDRS: [usize; 8] = [
-    0x0a000000, 0x0a000200, 0x0a000400, 0x0a000600, 0x0a000800, 0x0a000a00, 0x0a000c00, 0x0a000e00,
+    0x0a000000, 0x0a000200, 0x0a000400, 0x0a000600, 
+    0x0a000800, 0x0a000a00, 0x0a000c00, 0x0a000e00,
 ];
 
 pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(NETWORK_STATE);
-        if (*ptr).status != NetworkStatus::Uninitialized {
-            return Err("Network already initialized");
-        }
-        (*ptr).status = NetworkStatus::Initializing;
-    }
+    log("[Net] Initializing network stack...\n");
 
-    log(b"[Net] init\n");
+    // Find virtio-net device
+    let mut device: Option<VirtioNetDevice> = None;
+    let mut mac = [0u8; 6];
 
-    // Register lo0 (loopback)
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(NETWORK_STATE);
-        (*ptr).add_interface(b"lo0", InterfaceType::Loopback, [0; 6]);
-    }
-    log(b"[Net] lo0: UP\n");
-
-    // Scan for ethernet devices
     for (i, &addr) in VIRTIO_MMIO_ADDRS.iter().enumerate() {
-        log(b"[");
-        log(&[b'0' + i as u8]);
-        log(b"]");
-
         unsafe {
             // Check device ID (1 = network device)
             let device_id = core::ptr::read_volatile((addr + 0x008) as *const u32);
             if device_id != 1 {
-                log(b"- ");
                 continue;
             }
 
-            log(b"!\n");
+            log("[Net] Found virtio-net at slot ");
+            console::print(&alloc::format!("{}\n", i));
 
             // Create MMIO transport
             let header_ptr = match core::ptr::NonNull::new(addr as *mut VirtIOHeader) {
@@ -308,183 +212,227 @@ pub fn init(_dtb_ptr: usize) -> Result<(), &'static str> {
             let transport = match MmioTransport::new(header_ptr) {
                 Ok(t) => t,
                 Err(_) => {
-                    log(b"[Net] transport fail\n");
+                    log("[Net] Failed to create transport\n");
                     continue;
                 }
             };
-
-            log(b"[Net] virtio init...\n");
 
             // Initialize VirtIO network device
             let net = match VirtIONetRaw::<VirtioHal, MmioTransport, 16>::new(transport) {
                 Ok(n) => n,
                 Err(_) => {
-                    log(b"[Net] device fail\n");
+                    log("[Net] Failed to init virtio device\n");
                     continue;
                 }
             };
 
-            let mac = net.mac_address();
-            let mut dev = VirtioNetDevice { inner: net };
-
-            log(b"[Net] smoltcp...\n");
-
-            // Create smoltcp interface
-            let hw = EthernetAddress::from_bytes(&mac);
-            let cfg = Config::new(HardwareAddress::Ethernet(hw));
-            let _iface = Interface::new(cfg, &mut dev, Instant::ZERO);
-
-            // Log MAC address
-            log(b"[Net] eth0: ");
-            for (j, &b) in mac.iter().enumerate() {
-                if j > 0 {
-                    log(b":");
-                }
-                log_hex_byte(b);
-            }
-            log(b" UP\n");
-
-            // Register interface
-            let ptr = core::ptr::addr_of_mut!(NETWORK_STATE);
-            (*ptr).add_interface(b"eth0", InterfaceType::Ethernet, mac.into());
-            break; // Only handle first network device for now
+            mac = net.mac_address();
+            device = Some(VirtioNetDevice::new(net));
+            break;
         }
     }
 
-    // Mark as ready
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(NETWORK_STATE);
-        (*ptr).status = NetworkStatus::Ready;
+    let mut device = device.ok_or("No virtio-net device found")?;
+
+    // Log MAC address
+    log("[Net] MAC: ");
+    for (i, b) in mac.iter().enumerate() {
+        if i > 0 {
+            console::print(":");
+        }
+        console::print(&alloc::format!("{:02x}", b));
+    }
+    log("\n");
+
+    // Create smoltcp interface
+    let hw_addr = EthernetAddress::from_bytes(&mac);
+    let config = Config::new(HardwareAddress::Ethernet(hw_addr));
+    
+    let mut iface = Interface::new(config, &mut device, get_time());
+    
+    // Configure IP address (10.0.2.15 is the default for QEMU user-mode networking)
+    iface.update_ip_addrs(|addrs| {
+        addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).ok();
+    });
+    
+    // Set default gateway
+    iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2)).ok();
+
+    log("[Net] IP: 10.0.2.15/24, Gateway: 10.0.2.2\n");
+
+    // Create TCP socket with static buffers
+    let tcp_socket = unsafe {
+        let tcp_rx_buffer = TcpSocketBuffer::new(&mut TCP_RX_DATA[..]);
+        let tcp_tx_buffer = TcpSocketBuffer::new(&mut TCP_TX_DATA[..]);
+        TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer)
+    };
+
+    // Create socket set with static storage
+    let mut sockets = unsafe {
+        SocketSet::new(&mut SOCKET_STORAGE[..])
+    };
+    let tcp_handle = sockets.add(tcp_socket);
+
+    // Start listening
+    {
+        let socket = sockets.get_mut::<TcpSocket>(tcp_handle);
+        socket.listen(LISTEN_PORT).map_err(|_| "Failed to listen")?;
     }
 
-    log(b"[Net] Ready\n");
+    log(&alloc::format!("[Net] Listening on port {}\n", LISTEN_PORT));
+    log("[Net] Connect from host: nc localhost 2323\n");
+
+    // Store in global state
+    {
+        let mut stack = NET_STACK.lock();
+        *stack = Some(NetStack {
+            device,
+            iface,
+            sockets,
+            tcp_handle,
+            rx_pending: false,
+            rx_token: 0,
+        });
+    }
+    
+    *NET_INITIALIZED.lock() = true;
+
+    log("[Net] Network stack ready\n");
     Ok(())
 }
 
 // ============================================================================
-// Interface Listing
+// Time Helper
 // ============================================================================
 
-pub fn list_interfaces() {
-    unsafe {
-        let ptr = core::ptr::addr_of!(NETWORK_STATE);
-        let state = &*ptr;
-
-        log(b"\nInterfaces:\n");
-        for i in 0..state.interface_count {
-            let iface = &state.interfaces[i];
-
-            // Print name
-            for &c in iface.name.iter() {
-                if c != 0 {
-                    log(&[c]);
-                }
-            }
-            log(b": ");
-
-            // Print type and details
-            match iface.iface_type {
-                InterfaceType::Loopback => log(b"loopback"),
-                InterfaceType::Ethernet => {
-                    log(b"ethernet ");
-                    for (j, &b) in iface.mac.iter().enumerate() {
-                        if j > 0 {
-                            log(b":");
-                        }
-                        log_hex_byte(b);
-                    }
-                }
-                InterfaceType::None => log(b"none"),
-            }
-
-            // Print status
-            match iface.status {
-                InterfaceStatus::Up => log(b" UP"),
-                InterfaceStatus::Down => log(b" DOWN"),
-            }
-            log(b"\n");
-        }
-        log(b"\n");
-    }
+fn get_time() -> Instant {
+    let us = timer::uptime_us();
+    Instant::from_micros(us as i64)
 }
 
 // ============================================================================
-// Polling
+// Network Polling & TCP Handler
 // ============================================================================
 
-static mut TOTAL_PACKETS_RX: u64 = 0;
-static mut TOTAL_PACKETS_TX: u64 = 0;
-static mut POLL_COUNT: u64 = 0;
+static mut BYTES_RX: u64 = 0;
+static mut BYTES_TX: u64 = 0;
+static mut CONNECTIONS: u64 = 0;
+static mut WAS_CONNECTED: bool = false;
 
-/// Poll network interfaces for packets
-/// Returns number of packets processed in this poll cycle
-pub fn poll() -> usize {
-    let mut packets_processed = 0;
+/// Poll the network stack - call this regularly from a thread
+/// Returns true if there was activity
+pub fn poll() -> bool {
+    let mut stack_guard = NET_STACK.lock();
+    let stack = match stack_guard.as_mut() {
+        Some(s) => s,
+        _ => return false,
+    };
 
-    unsafe {
-        let poll_count = core::ptr::addr_of_mut!(POLL_COUNT);
-        *poll_count += 1;
+    let timestamp = get_time();
+    
+    // Process network interface
+    let activity = stack.iface.poll(timestamp, &mut stack.device, &mut stack.sockets);
 
-        // TODO: Actually poll virtio RX queue here
-        // For now, just log periodically to show we're running
-        if *poll_count % 1000000 == 0 {
-            log(b"[Net] poll #");
-            log_u64(*poll_count);
-            log(b"\n");
+    // Handle TCP socket
+    let socket = stack.sockets.get_mut::<TcpSocket>(stack.tcp_handle);
+    
+    // Check for new connection
+    if socket.state() == TcpState::Established {
+        unsafe {
+            if !WAS_CONNECTED {
+                WAS_CONNECTED = true;
+                CONNECTIONS += 1;
+                // Release lock before printing
+                drop(stack_guard);
+                log("\n[Net] *** Client connected! ***\n");
+                log("[Net] Type something and press Enter (echo server)\n");
+                log("[Net] Type 'quit' to disconnect\n\n");
+                return true;
+            }
+        }
+    } else if socket.state() == TcpState::Listen || socket.state() == TcpState::Closed {
+        unsafe {
+            WAS_CONNECTED = false;
         }
     }
 
-    // TODO: Process incoming packets from virtio
-    // packets_processed += process_rx_queue();
+    // Echo any received data back
+    if socket.can_recv() {
+        let mut buf = [0u8; 512];
+        match socket.recv_slice(&mut buf) {
+            Ok(len) if len > 0 => {
+                unsafe { BYTES_RX += len as u64; }
+                
+                // Check for 'quit' command
+                let data = &buf[..len];
+                if len >= 4 && (data.starts_with(b"quit") || data.starts_with(b"exit")) {
+                    let _ = socket.send_slice(b"Goodbye!\r\n");
+                    socket.close();
+                    drop(stack_guard);
+                    log("[Net] Client disconnected (quit)\n");
+                    return true;
+                }
 
-    // TODO: Process outgoing packets
-    // packets_processed += process_tx_queue();
+                // Echo back with prefix
+                if socket.can_send() {
+                    let _ = socket.send_slice(b"echo: ");
+                    let _ = socket.send_slice(&buf[..len]);
+                    unsafe { BYTES_TX += (6 + len) as u64; }
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
 
-    packets_processed
+    // Re-listen if socket closed
+    if socket.state() == TcpState::Closed {
+        let _ = socket.listen(LISTEN_PORT);
+    }
+
+    activity
 }
 
-/// Get total received packet count
-pub fn total_rx_packets() -> u64 {
+/// Thread entry point for network server
+#[unsafe(no_mangle)]
+pub extern "C" fn netcat_server_entry() -> ! {
+    log("[Net] Netcat server thread started\n");
+    
+    loop {
+        poll();
+        // Yield to other threads
+        crate::threading::yield_now();
+    }
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Run the network handler in a loop (call from a dedicated thread)
+pub fn run_netcat_server() {
+    log("[Net] Starting netcat echo server...\n");
+    
+    loop {
+        poll();
+        crate::threading::yield_now();
+    }
+}
+
+/// Print network statistics
+pub fn stats() {
     unsafe {
-        let ptr = core::ptr::addr_of!(TOTAL_PACKETS_RX);
-        *ptr
+        let connections = core::ptr::read_volatile(core::ptr::addr_of!(CONNECTIONS));
+        let bytes_rx = core::ptr::read_volatile(core::ptr::addr_of!(BYTES_RX));
+        let bytes_tx = core::ptr::read_volatile(core::ptr::addr_of!(BYTES_TX));
+        log(&alloc::format!(
+            "[Net] Stats: {} connections, {} bytes RX, {} bytes TX\n",
+            connections, bytes_rx, bytes_tx
+        ));
     }
 }
 
-/// Get total transmitted packet count  
-pub fn total_tx_packets() -> u64 {
-    unsafe {
-        let ptr = core::ptr::addr_of!(TOTAL_PACKETS_TX);
-        *ptr
-    }
-}
-
-/// Get total poll count
-pub fn poll_count() -> u64 {
-    unsafe {
-        let ptr = core::ptr::addr_of!(POLL_COUNT);
-        *ptr
-    }
-}
-
-fn log_u64(mut n: u64) {
-    if n == 0 {
-        log(b"0");
-        return;
-    }
-
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-
-    while n > 0 {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-
-    // Reverse and print
-    while i > 0 {
-        i -= 1;
-        log(&[buf[i]]);
-    }
+/// Check if network is initialized
+pub fn is_ready() -> bool {
+    *NET_INITIALIZED.lock()
 }

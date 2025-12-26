@@ -152,7 +152,20 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
     // =========================================================================
     console::print("\n--- Network Initialization ---\n");
     match network::init(0) {
-        Ok(()) => console::print("[Net] Network initialized successfully\n"),
+        Ok(()) => {
+            console::print("[Net] Network initialized successfully\n");
+            console::print("[Net] Starting network server thread...\n");
+            
+            // Spawn network handler thread
+            match threading::spawn(network::netcat_server_entry) {
+                Ok(tid) => console::print(&alloc::format!("[Net] Server thread started (tid={})\n", tid)),
+                Err(e) => {
+                    console::print("[Net] Failed to spawn server thread: ");
+                    console::print(e);
+                    console::print("\n");
+                }
+            }
+        }
         Err(e) => {
             console::print("[Net] Network init failed: ");
             console::print(e);
@@ -161,11 +174,8 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
     }
     console::print("--- Network Initialization Done ---\n\n");
 
-    // console::print("Enabling IRQ interrupts for other threads\n");
-    // enable irq interrupts for other threads here
-
     // Thread 0 becomes the idle loop
-    console::print("[Idle] Entering idle loop\n");
+    console::print("[Idle] Entering idle loop (network server running in background)\n");
     loop {
         threading::yield_now();
     }
