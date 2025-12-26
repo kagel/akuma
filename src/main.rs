@@ -14,6 +14,7 @@ mod gic;
 mod irq;
 mod network;
 mod ssh;
+mod ssh_crypto;
 mod tests;
 mod threading;
 mod timer;

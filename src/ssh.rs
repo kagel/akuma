@@ -14,18 +14,21 @@ use alloc::vec;
 use core::convert::TryInto;
 use spinning_top::Spinlock;
 
-use aes::Aes128;
-use ctr::{Ctr128BE, cipher::{KeyIvInit, StreamCipher}};
 use curve25519_dalek::scalar::Scalar;
 use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
 use ed25519_dalek::{SigningKey, Signer, SECRET_KEY_LENGTH};
-use hmac::{Hmac, Mac};
+use hmac::Mac;
 use sha2::{Sha256, Digest};
 
 use crate::akuma::AKUMA_79;
 use crate::console;
 use crate::network::{self, SshEvent};
-use crate::timer;
+use crate::ssh_crypto::{
+    SimpleRng, CryptoState, Aes128Ctr, HmacSha256,
+    AES_KEY_SIZE, AES_IV_SIZE, MAC_KEY_SIZE, MAC_SIZE,
+    write_u32, write_string, write_namelist, read_u32, read_string,
+    build_packet, build_encrypted_packet, derive_key, trim_bytes, split_first_word,
+};
 
 // ============================================================================
 // SSH Constants
@@ -64,44 +67,6 @@ const CIPHER_ALGO: &str = "aes128-ctr";
 const MAC_ALGO: &str = "hmac-sha2-256";
 const COMPRESS_ALGO: &str = "none";
 
-// Sizes
-const AES_KEY_SIZE: usize = 16;
-const AES_IV_SIZE: usize = 16;
-const MAC_KEY_SIZE: usize = 32;
-const MAC_SIZE: usize = 32;
-
-// ============================================================================
-// Simple RNG using timer entropy
-// ============================================================================
-
-struct SimpleRng {
-    state: u64,
-}
-
-impl SimpleRng {
-    fn new() -> Self {
-        let seed = timer::uptime_us() ^ 0xDEADBEEFCAFEBABE;
-        Self { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 7;
-        self.state ^= self.state << 17;
-        self.state
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        for chunk in dest.chunks_mut(8) {
-            let val = self.next_u64();
-            let bytes = val.to_le_bytes();
-            for (i, b) in chunk.iter_mut().enumerate() {
-                *b = bytes[i];
-            }
-        }
-    }
-}
-
 // ============================================================================
 // SSH State Machine
 // ============================================================================
@@ -116,35 +81,6 @@ enum SshState {
     AwaitingUserAuth,
     Authenticated,
     Disconnected,
-}
-
-// ============================================================================
-// Crypto State
-// ============================================================================
-
-type Aes128Ctr = Ctr128BE<Aes128>;
-type HmacSha256 = Hmac<Sha256>;
-
-struct CryptoState {
-    decrypt_cipher: Option<Aes128Ctr>,
-    decrypt_mac_key: [u8; MAC_KEY_SIZE],
-    decrypt_seq: u32,
-    encrypt_cipher: Option<Aes128Ctr>,
-    encrypt_mac_key: [u8; MAC_KEY_SIZE],
-    encrypt_seq: u32,
-}
-
-impl CryptoState {
-    fn new() -> Self {
-        Self {
-            decrypt_cipher: None,
-            decrypt_mac_key: [0u8; MAC_KEY_SIZE],
-            decrypt_seq: 0,
-            encrypt_cipher: None,
-            encrypt_mac_key: [0u8; MAC_KEY_SIZE],
-            encrypt_seq: 0,
-        }
-    }
 }
 
 // ============================================================================
@@ -208,85 +144,6 @@ impl SshSession {
 static SESSION: Spinlock<Option<SshSession>> = Spinlock::new(None);
 
 // ============================================================================
-// SSH Packet Helpers
-// ============================================================================
-
-fn write_u32(buf: &mut Vec<u8>, val: u32) {
-    buf.extend_from_slice(&val.to_be_bytes());
-}
-
-fn write_string(buf: &mut Vec<u8>, s: &[u8]) {
-    write_u32(buf, s.len() as u32);
-    buf.extend_from_slice(s);
-}
-
-fn write_namelist(buf: &mut Vec<u8>, names: &[&str]) {
-    let joined = names.join(",");
-    write_string(buf, joined.as_bytes());
-}
-
-fn read_u32(data: &[u8], offset: &mut usize) -> Option<u32> {
-    if *offset + 4 > data.len() {
-        return None;
-    }
-    let val = u32::from_be_bytes(data[*offset..*offset+4].try_into().ok()?);
-    *offset += 4;
-    Some(val)
-}
-
-fn read_string<'a>(data: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
-    let len = read_u32(data, offset)? as usize;
-    if *offset + len > data.len() {
-        return None;
-    }
-    let s = &data[*offset..*offset+len];
-    *offset += len;
-    Some(s)
-}
-
-fn build_packet(payload: &[u8]) -> Vec<u8> {
-    let padding_len = 8 - ((5 + payload.len()) % 8);
-    let padding_len = if padding_len < 4 { padding_len + 8 } else { padding_len };
-    
-    let packet_len = 1 + payload.len() + padding_len;
-    let mut packet = Vec::with_capacity(4 + packet_len);
-    
-    write_u32(&mut packet, packet_len as u32);
-    packet.push(padding_len as u8);
-    packet.extend_from_slice(payload);
-    packet.resize(packet.len() + padding_len, 0);
-    
-    packet
-}
-
-fn build_encrypted_packet(payload: &[u8], cipher: &mut Aes128Ctr, mac_key: &[u8; MAC_KEY_SIZE], seq: u32) -> Vec<u8> {
-    let padding_len = 16 - ((5 + payload.len()) % 16);
-    let padding_len = if padding_len < 4 { padding_len + 16 } else { padding_len };
-    
-    let packet_len = 1 + payload.len() + padding_len;
-    let mut packet = Vec::with_capacity(4 + packet_len + MAC_SIZE);
-    
-    write_u32(&mut packet, packet_len as u32);
-    packet.push(padding_len as u8);
-    packet.extend_from_slice(payload);
-    
-    let mut rng = SimpleRng::new();
-    let pad_start = packet.len();
-    packet.resize(pad_start + padding_len, 0);
-    rng.fill_bytes(&mut packet[pad_start..]);
-    
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(mac_key).unwrap();
-    mac.update(&seq.to_be_bytes());
-    mac.update(&packet);
-    let mac_result = mac.finalize().into_bytes();
-    
-    cipher.apply_keystream(&mut packet);
-    packet.extend_from_slice(&mac_result);
-    
-    packet
-}
-
-// ============================================================================
 // KEXINIT Message
 // ============================================================================
 
@@ -317,37 +174,6 @@ fn build_kexinit(rng: &mut SimpleRng) -> Vec<u8> {
 // ============================================================================
 // Key Exchange
 // ============================================================================
-
-fn derive_key(k: &[u8], h: &[u8], letter: u8, session_id: &[u8], size: usize) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    
-    let mut k_mpint = Vec::new();
-    if !k.is_empty() && k[0] & 0x80 != 0 {
-        write_u32(&mut k_mpint, (k.len() + 1) as u32);
-        k_mpint.push(0);
-    } else {
-        write_u32(&mut k_mpint, k.len() as u32);
-    }
-    k_mpint.extend_from_slice(k);
-    
-    hasher.update(&k_mpint);
-    hasher.update(h);
-    hasher.update(&[letter]);
-    hasher.update(session_id);
-    
-    let mut result: Vec<u8> = hasher.finalize().to_vec();
-    
-    while result.len() < size {
-        let mut hasher = Sha256::new();
-        hasher.update(&k_mpint);
-        hasher.update(h);
-        hasher.update(&result);
-        result.extend_from_slice(&hasher.finalize());
-    }
-    
-    result.truncate(size);
-    result
-}
 
 fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Option<Vec<u8>> {
     let mut scalar_bytes = [0u8; 32];
@@ -382,6 +208,7 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
     write_string(&mut hash_data, client_pubkey);
     write_string(&mut hash_data, &server_pubkey);
     
+    // K as mpint
     if !shared_secret.is_empty() && shared_secret[0] & 0x80 != 0 {
         write_u32(&mut hash_data, (shared_secret.len() + 1) as u32);
         hash_data.push(0);
@@ -403,6 +230,7 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
     write_string(&mut sig_blob, b"ssh-ed25519");
     write_string(&mut sig_blob, signature.to_bytes().as_slice());
     
+    // Derive encryption keys
     let iv_c2s = derive_key(&shared_secret, &exchange_hash, b'A', &session.session_id, AES_IV_SIZE);
     let iv_s2c = derive_key(&shared_secret, &exchange_hash, b'B', &session.session_id, AES_IV_SIZE);
     let key_c2s = derive_key(&shared_secret, &exchange_hash, b'C', &session.session_id, AES_KEY_SIZE);
@@ -410,6 +238,7 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
     let mac_c2s = derive_key(&shared_secret, &exchange_hash, b'E', &session.session_id, MAC_KEY_SIZE);
     let mac_s2c = derive_key(&shared_secret, &exchange_hash, b'F', &session.session_id, MAC_KEY_SIZE);
     
+    use ctr::cipher::KeyIvInit;
     session.crypto.decrypt_cipher = Some(Aes128Ctr::new(
         key_c2s[..AES_KEY_SIZE].try_into().unwrap(),
         iv_c2s[..AES_IV_SIZE].try_into().unwrap()
@@ -422,6 +251,7 @@ fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Optio
     ));
     session.crypto.encrypt_mac_key.copy_from_slice(&mac_s2c[..MAC_KEY_SIZE]);
     
+    // Build KEX_ECDH_REPLY
     let mut reply = Vec::new();
     reply.push(SSH_MSG_KEX_ECDH_REPLY);
     write_string(&mut reply, &host_key_blob);
@@ -531,20 +361,6 @@ fn is_quit_command(line: &[u8]) -> bool {
     let line = trim_bytes(line);
     let (cmd, _) = split_first_word(line);
     cmd == b"quit" || cmd == b"exit"
-}
-
-fn trim_bytes(data: &[u8]) -> &[u8] {
-    let start = data.iter().position(|&b| !b.is_ascii_whitespace()).unwrap_or(data.len());
-    let end = data.iter().rposition(|&b| !b.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(start);
-    &data[start..end]
-}
-
-fn split_first_word(data: &[u8]) -> (&[u8], &[u8]) {
-    if let Some(pos) = data.iter().position(|&b| b.is_ascii_whitespace()) {
-        (&data[..pos], trim_bytes(&data[pos..]))
-    } else {
-        (data, &[])
-    }
 }
 
 fn handle_shell_input(session: &mut SshSession, data: &[u8]) {
@@ -768,6 +584,7 @@ fn process_encrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)> {
     let mut encrypted_part = session.input_buffer[..mac_start].to_vec();
     let received_mac = &session.input_buffer[mac_start..];
     
+    use ctr::cipher::StreamCipher;
     cipher.apply_keystream(&mut encrypted_part);
     
     let seq = session.crypto.decrypt_seq;
