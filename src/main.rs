@@ -122,20 +122,6 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
     console::print("Threading system initialized\n");
 
     // =========================================================================
-    // Network initialization
-    // =========================================================================
-    console::print("\n--- Network Initialization ---\n");
-    match network::init(0) {
-        Ok(()) => console::print("[Net] Network initialized successfully\n"),
-        Err(e) => {
-            console::print("[Net] Network init failed: ");
-            console::print(e);
-            console::print("\n");
-        }
-    }
-    console::print("--- Network Initialization Done ---\n\n");
-
-    // =========================================================================
     // Now enable preemptive scheduling (timer interrupts)
     // =========================================================================
     console::print("Configuring scheduler SGI...\n");
@@ -161,8 +147,19 @@ pub extern "C" fn rust_start(_dtb_ptr: usize) -> ! {
         }
     }
 
-    // Network disabled - just proceed to idle loop
-    console::print("Network disabled, skipping network thread\n");
+    // =========================================================================
+    // Network initialization
+    // =========================================================================
+    console::print("\n--- Network Initialization ---\n");
+    match network::init(0) {
+        Ok(()) => console::print("[Net] Network initialized successfully\n"),
+        Err(e) => {
+            console::print("[Net] Network init failed: ");
+            console::print(e);
+            console::print("\n");
+        }
+    }
+    console::print("--- Network Initialization Done ---\n\n");
 
     // console::print("Enabling IRQ interrupts for other threads\n");
     // enable irq interrupts for other threads here
