@@ -184,19 +184,35 @@ impl TcpStream {
     /// Read data from the stream
     /// Returns the number of bytes read, or 0 if connection closed
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TcpError> {
-        self.socket
+        let result = self
+            .socket
             .read(buf)
             .await
-            .map_err(|_| TcpError::ReadFailed)
+            .map_err(|_| TcpError::ReadFailed);
+
+        // Track bytes received
+        if let Ok(n) = &result {
+            crate::network::add_bytes_rx(*n as u64);
+        }
+
+        result
     }
 
     /// Write data to the stream
     /// Returns the number of bytes written
     pub async fn write(&mut self, data: &[u8]) -> Result<usize, TcpError> {
-        self.socket
+        let result = self
+            .socket
             .write(data)
             .await
-            .map_err(|_| TcpError::WriteFailed)
+            .map_err(|_| TcpError::WriteFailed);
+
+        // Track bytes transmitted
+        if let Ok(n) = &result {
+            crate::network::add_bytes_tx(*n as u64);
+        }
+
+        result
     }
 
     /// Write all data to the stream

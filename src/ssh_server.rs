@@ -109,16 +109,19 @@ pub async fn run(stack: Stack<'static>) {
                             let id = next_id;
                             next_id = next_id.wrapping_add(1);
 
-                            log(&alloc::format!(
-                                "[SSH Server] Accepted connection {} (active: 1)\n",
-                                id
-                            ));
+                        log(&alloc::format!(
+                            "[SSH Server] Accepted connection {} (active: 1)\n",
+                            id
+                        ));
 
-                            // Take the socket and create a new one for listening
-                            let connected_socket = listen_socket.take().unwrap();
-                            let stream = TcpStream::from_socket(connected_socket);
-                            let future = Box::pin(handle_connection_wrapper(stream, id));
-                            connections.push(ActiveConnection { future, id });
+                        // Track connection in stats
+                        crate::network::increment_connections();
+
+                        // Take the socket and create a new one for listening
+                        let connected_socket = listen_socket.take().unwrap();
+                        let stream = TcpStream::from_socket(connected_socket);
+                        let future = Box::pin(handle_connection_wrapper(stream, id));
+                        connections.push(ActiveConnection { future, id });
                         }
                         Err(e) => {
                             log(&alloc::format!("[SSH Server] Accept error: {:?}\n", e));
@@ -138,19 +141,22 @@ pub async fn run(stack: Stack<'static>) {
                             let id = next_id;
                             next_id = next_id.wrapping_add(1);
 
-                            log(&alloc::format!(
-                                "[SSH Server] Accepted connection {} (active: {})\n",
-                                id,
-                                connections.len() + 1
-                            ));
+                        log(&alloc::format!(
+                            "[SSH Server] Accepted connection {} (active: {})\n",
+                            id,
+                            connections.len() + 1
+                        ));
 
-                            // Take the socket and create a new one for listening
-                            let connected_socket = listen_socket.take().unwrap();
-                            let stream = TcpStream::from_socket(connected_socket);
-                            let future = Box::pin(handle_connection_wrapper(stream, id));
-                            connections.push(ActiveConnection { future, id });
-                        }
-                        Ok(Err(e)) => {
+                        // Track connection in stats
+                        crate::network::increment_connections();
+
+                        // Take the socket and create a new one for listening
+                        let connected_socket = listen_socket.take().unwrap();
+                        let stream = TcpStream::from_socket(connected_socket);
+                        let future = Box::pin(handle_connection_wrapper(stream, id));
+                        connections.push(ActiveConnection { future, id });
+                    }
+                    Ok(Err(e)) => {
                             log(&alloc::format!("[SSH Server] Accept error: {:?}\n", e));
                             listen_socket = None;
                         }
