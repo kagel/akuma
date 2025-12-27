@@ -176,6 +176,11 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
+    /// Create a TcpStream from an already-connected socket
+    pub fn from_socket(socket: TcpSocket<'static>) -> Self {
+        Self { socket }
+    }
+
     /// Read data from the stream
     /// Returns the number of bytes read, or 0 if connection closed
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TcpError> {
