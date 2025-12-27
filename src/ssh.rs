@@ -413,7 +413,7 @@ fn execute_command(line: &[u8]) -> Vec<u8> {
         b"help" => {
             response.extend_from_slice(b"Available commands:\r\n");
             response.extend_from_slice(b"  echo <text>  - Echo back text\r\n");
-            response.extend_from_slice(b"  cat          - Display ASCII art\r\n");
+            response.extend_from_slice(b"  akuma        - Display ASCII art\r\n");
             response.extend_from_slice(b"  stats        - Show network statistics\r\n");
             response.extend_from_slice(b"  help         - Show this help\r\n");
             response.extend_from_slice(b"  quit/exit    - Close connection\r\n");
